@@ -97,7 +97,7 @@ async def _save_upload_file(
             total_bytes += len(chunk)
             if total_bytes > max_bytes:
                 raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
                     detail=f"{label} exceeds the maximum allowed size of {max_bytes} bytes.",
                 )
 
