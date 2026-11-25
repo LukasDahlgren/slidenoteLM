@@ -23,6 +23,7 @@ from .auth import (
 from .config import REPO_ROOT, Settings, load_settings
 from .db import JobStore, generate_job_token
 from .pipeline import StageHandler
+from .ratelimit import RateLimitMiddleware, SlidingWindowRateLimiter
 from .schemas import (
     ARTIFACT_SLIDES_PDF,
     PIPELINE_STAGES,
@@ -280,6 +281,7 @@ def create_app(
     settings: Settings | None = None,
     stage_handlers: dict[PipelineStage, StageHandler] | None = None,
     frontend_dist_dir: Path | None = None,
+    rate_limiter: SlidingWindowRateLimiter | None = None,
 ) -> FastAPI:
     resolved_settings = settings or load_settings()
     resolved_dist_dir = (
@@ -287,6 +289,7 @@ def create_app(
         if frontend_dist_dir is not None
         else (REPO_ROOT / "frontend" / "dist")
     ).resolve()
+    resolved_rate_limiter = rate_limiter or SlidingWindowRateLimiter()
     store = JobStore(resolved_settings.db_path)
     worker = JobWorker(store, resolved_settings, stage_handlers=stage_handlers)
 
@@ -309,14 +312,26 @@ def create_app(
     application.state.store = store
     application.state.worker = worker
     application.state.frontend_dist_dir = resolved_dist_dir
+    application.state.rate_limiter = resolved_rate_limiter
 
     application.add_middleware(AppPasswordMiddleware, settings=resolved_settings)
+    application.add_middleware(
+        RateLimitMiddleware,
+        settings=resolved_settings,
+        limiter=resolved_rate_limiter,
+    )
     application.add_middleware(
         CORSMiddleware,
         allow_origins=list(resolved_settings.frontend_origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "Retry-After",
+            "X-RateLimit-Limit",
+            "X-RateLimit-Remaining",
+            "X-RateLimit-Reset",
+        ],
     )
 
     @application.get("/api/health", response_model=HealthResponse)

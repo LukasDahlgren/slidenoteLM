@@ -36,6 +36,7 @@ DEFAULT_TRANSCRIBE_CHUNK_HEADROOM_PCT = 90
 DEFAULT_TRANSCRIBE_MIN_CHUNK_SECONDS = 300
 DEFAULT_TRANSCRIBE_PARALLEL_WORKERS = 4
 DEFAULT_TRANSCRIBE_GLOBAL_MAX_CONCURRENT = 6
+DEFAULT_TRANSCRIBE_RATE_LIMIT_RPM = 20
 DEFAULT_TRANSCRIBE_RETRY_ATTEMPTS = 3
 DEFAULT_TRANSCRIBE_RETRY_BASE_DELAY_SECONDS = 3.0
 DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS = 180.0
@@ -46,10 +47,22 @@ DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # 18 MiB (safely below Gemini's 
 DEFAULT_OCR_PARALLEL_WORKERS = 2
 DEFAULT_OCR_PARALLEL_MIN_PAGES = 4
 DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 4
+DEFAULT_OCR_RATE_LIMIT_RPM = 20
 DEFAULT_OCR_RETRY_ATTEMPTS = 3
 DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS = 2.0
 DEFAULT_OCR_TIMEOUT_SECONDS = 180.0
 DEFAULT_OCR_MAX_OUTPUT_TOKENS = 32768
+
+# HTTP API rate-limiting defaults (sliding window per client IP; 0 disables a bucket)
+DEFAULT_RATE_LIMIT_ENABLED = True
+DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
+DEFAULT_RATE_LIMIT_TRUST_PROXY_HEADERS = True
+DEFAULT_RATE_LIMIT_AUTH_LOGIN_PER_WINDOW = 10
+DEFAULT_RATE_LIMIT_AUTH_PER_WINDOW = 60
+DEFAULT_RATE_LIMIT_JOBS_CREATE_PER_WINDOW = 10
+DEFAULT_RATE_LIMIT_JOBS_READ_PER_WINDOW = 120
+DEFAULT_RATE_LIMIT_HEALTH_PER_WINDOW = 120
+DEFAULT_RATE_LIMIT_DEFAULT_PER_WINDOW = 120
 
 
 def _parse_int_env(name: str, default: int, *, minimum: int = 1) -> int:
@@ -144,6 +157,7 @@ class Settings:
     transcribe_min_chunk_seconds: int = DEFAULT_TRANSCRIBE_MIN_CHUNK_SECONDS
     transcribe_parallel_workers: int = DEFAULT_TRANSCRIBE_PARALLEL_WORKERS
     transcribe_global_max_concurrent: int = DEFAULT_TRANSCRIBE_GLOBAL_MAX_CONCURRENT
+    transcribe_rate_limit_rpm: int = DEFAULT_TRANSCRIBE_RATE_LIMIT_RPM
     transcribe_retry_attempts: int = DEFAULT_TRANSCRIBE_RETRY_ATTEMPTS
     transcribe_retry_base_delay_seconds: float = DEFAULT_TRANSCRIBE_RETRY_BASE_DELAY_SECONDS
     transcribe_timeout_seconds: float = DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS
@@ -152,6 +166,7 @@ class Settings:
     ocr_parallel_workers: int = DEFAULT_OCR_PARALLEL_WORKERS
     ocr_parallel_min_pages: int = DEFAULT_OCR_PARALLEL_MIN_PAGES
     ocr_global_max_concurrent: int = DEFAULT_OCR_GLOBAL_MAX_CONCURRENT
+    ocr_rate_limit_rpm: int = DEFAULT_OCR_RATE_LIMIT_RPM
     ocr_retry_attempts: int = DEFAULT_OCR_RETRY_ATTEMPTS
     ocr_retry_base_delay_seconds: float = DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS
     ocr_timeout_seconds: float = DEFAULT_OCR_TIMEOUT_SECONDS
@@ -160,6 +175,15 @@ class Settings:
     ffprobe_path: str = ""
     app_password: str = ""
     app_session_secret: str = ""
+    rate_limit_enabled: bool = DEFAULT_RATE_LIMIT_ENABLED
+    rate_limit_window_seconds: int = DEFAULT_RATE_LIMIT_WINDOW_SECONDS
+    rate_limit_trust_proxy_headers: bool = DEFAULT_RATE_LIMIT_TRUST_PROXY_HEADERS
+    rate_limit_auth_login_per_window: int = DEFAULT_RATE_LIMIT_AUTH_LOGIN_PER_WINDOW
+    rate_limit_auth_per_window: int = DEFAULT_RATE_LIMIT_AUTH_PER_WINDOW
+    rate_limit_jobs_create_per_window: int = DEFAULT_RATE_LIMIT_JOBS_CREATE_PER_WINDOW
+    rate_limit_jobs_read_per_window: int = DEFAULT_RATE_LIMIT_JOBS_READ_PER_WINDOW
+    rate_limit_health_per_window: int = DEFAULT_RATE_LIMIT_HEALTH_PER_WINDOW
+    rate_limit_default_per_window: int = DEFAULT_RATE_LIMIT_DEFAULT_PER_WINDOW
 
     @property
     def transcribe_safe_upload_bytes(self) -> int:
@@ -245,6 +269,11 @@ def load_settings(
             DEFAULT_TRANSCRIBE_GLOBAL_MAX_CONCURRENT,
             minimum=1,
         ),
+        transcribe_rate_limit_rpm=_parse_int_env(
+            "TRANSCRIBE_RATE_LIMIT_RPM",
+            DEFAULT_TRANSCRIBE_RATE_LIMIT_RPM,
+            minimum=0,
+        ),
         transcribe_retry_attempts=_parse_int_env(
             "TRANSCRIBE_RETRY_ATTEMPTS",
             DEFAULT_TRANSCRIBE_RETRY_ATTEMPTS,
@@ -285,6 +314,11 @@ def load_settings(
             DEFAULT_OCR_GLOBAL_MAX_CONCURRENT,
             minimum=1,
         ),
+        ocr_rate_limit_rpm=_parse_int_env(
+            "OCR_RATE_LIMIT_RPM",
+            DEFAULT_OCR_RATE_LIMIT_RPM,
+            minimum=0,
+        ),
         ocr_retry_attempts=_parse_int_env(
             "OCR_RETRY_ATTEMPTS",
             DEFAULT_OCR_RETRY_ATTEMPTS,
@@ -309,4 +343,47 @@ def load_settings(
         ffprobe_path=os.getenv("FFPROBE_PATH", "").strip(),
         app_password=os.getenv("APP_PASSWORD", "").strip(),
         app_session_secret=os.getenv("APP_SESSION_SECRET", "").strip(),
+        rate_limit_enabled=_parse_bool_env(
+            "RATE_LIMIT_ENABLED",
+            DEFAULT_RATE_LIMIT_ENABLED,
+        ),
+        rate_limit_window_seconds=_parse_int_env(
+            "RATE_LIMIT_WINDOW_SECONDS",
+            DEFAULT_RATE_LIMIT_WINDOW_SECONDS,
+            minimum=1,
+        ),
+        rate_limit_trust_proxy_headers=_parse_bool_env(
+            "RATE_LIMIT_TRUST_PROXY_HEADERS",
+            DEFAULT_RATE_LIMIT_TRUST_PROXY_HEADERS,
+        ),
+        rate_limit_auth_login_per_window=_parse_int_env(
+            "RATE_LIMIT_AUTH_LOGIN_PER_MINUTE",
+            DEFAULT_RATE_LIMIT_AUTH_LOGIN_PER_WINDOW,
+            minimum=0,
+        ),
+        rate_limit_auth_per_window=_parse_int_env(
+            "RATE_LIMIT_AUTH_PER_MINUTE",
+            DEFAULT_RATE_LIMIT_AUTH_PER_WINDOW,
+            minimum=0,
+        ),
+        rate_limit_jobs_create_per_window=_parse_int_env(
+            "RATE_LIMIT_JOBS_CREATE_PER_MINUTE",
+            DEFAULT_RATE_LIMIT_JOBS_CREATE_PER_WINDOW,
+            minimum=0,
+        ),
+        rate_limit_jobs_read_per_window=_parse_int_env(
+            "RATE_LIMIT_JOBS_READ_PER_MINUTE",
+            DEFAULT_RATE_LIMIT_JOBS_READ_PER_WINDOW,
+            minimum=0,
+        ),
+        rate_limit_health_per_window=_parse_int_env(
+            "RATE_LIMIT_HEALTH_PER_MINUTE",
+            DEFAULT_RATE_LIMIT_HEALTH_PER_WINDOW,
+            minimum=0,
+        ),
+        rate_limit_default_per_window=_parse_int_env(
+            "RATE_LIMIT_DEFAULT_PER_MINUTE",
+            DEFAULT_RATE_LIMIT_DEFAULT_PER_WINDOW,
+            minimum=0,
+        ),
     )

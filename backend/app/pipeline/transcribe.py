@@ -14,6 +14,7 @@ import httpx
 from groq import Groq
 
 from ..config import Settings
+from ..ratelimit import OutboundRateLimiter
 from ..schemas import (
     ARTIFACT_TRANSCRIPT,
     JobContext,
@@ -49,6 +50,8 @@ _MAX_RETRY_AFTER_SECONDS = 60.0
 
 _semaphore_lock = threading.Lock()
 _global_transcribe_semaphores: dict[int, threading.BoundedSemaphore] = {}
+_rate_limiter_lock = threading.Lock()
+_global_transcribe_rate_limiters: dict[int, OutboundRateLimiter] = {}
 
 
 def _get_global_transcribe_semaphore(max_concurrent: int) -> threading.BoundedSemaphore:
@@ -59,6 +62,18 @@ def _get_global_transcribe_semaphore(max_concurrent: int) -> threading.BoundedSe
             semaphore = threading.BoundedSemaphore(limit)
             _global_transcribe_semaphores[limit] = semaphore
         return semaphore
+
+
+def _get_global_transcribe_rate_limiter(max_rpm: int) -> OutboundRateLimiter | None:
+    limit = max(0, int(max_rpm))
+    if limit <= 0:
+        return None
+    with _rate_limiter_lock:
+        limiter = _global_transcribe_rate_limiters.get(limit)
+        if limiter is None:
+            limiter = OutboundRateLimiter(max_requests=limit, window_seconds=60.0)
+            _global_transcribe_rate_limiters[limit] = limiter
+        return limiter
 
 
 def _default_groq_client_factory(settings: Settings) -> Groq:
@@ -252,8 +267,25 @@ def _transcribe_single_file_once(
     *,
     model: str,
     semaphore: threading.BoundedSemaphore,
+    rate_limiter: OutboundRateLimiter | None = None,
+    chunk_label: str | None = None,
+    progress_callback: ProgressCallback | None = None,
+    sleep_fn: SleepFn = time.sleep,
     fallback_duration: float = 0.0,
 ) -> list[dict[str, Any]]:
+    if rate_limiter is not None:
+        def _notify_wait(wait_seconds: float) -> None:
+            wait_msg = (
+                f"Groq rate limit pacing ({chunk_label}); waiting {wait_seconds:.1f}s..."
+                if chunk_label
+                else f"Groq rate limit pacing; waiting {wait_seconds:.1f}s..."
+            )
+            logger.info("%s", wait_msg)
+            if progress_callback is not None:
+                progress_callback(wait_msg)
+
+        rate_limiter.acquire(sleep_fn=sleep_fn, on_wait=_notify_wait)
+
     with semaphore:
         with mp3_path.open("rb") as audio_handle:
             response = client.audio.transcriptions.create(
@@ -271,6 +303,7 @@ def _transcribe_single_file_with_retries(
     *,
     settings: Settings,
     semaphore: threading.BoundedSemaphore,
+    rate_limiter: OutboundRateLimiter | None = None,
     chunk_label: str | None = None,
     fallback_duration: float = 0.0,
     progress_callback: ProgressCallback | None = None,
@@ -288,6 +321,10 @@ def _transcribe_single_file_with_retries(
                 mp3_path,
                 model=settings.transcription_model,
                 semaphore=semaphore,
+                rate_limiter=rate_limiter,
+                chunk_label=chunk_label,
+                progress_callback=progress_callback,
+                sleep_fn=sleep_fn,
                 fallback_duration=fallback_duration,
             )
             if attempt > 1 and warnings is not None:
@@ -375,6 +412,7 @@ def _transcribe_in_chunks(
     ffmpeg_bin: str,
     settings: Settings,
     semaphore: threading.BoundedSemaphore,
+    rate_limiter: OutboundRateLimiter | None = None,
     progress_callback: ProgressCallback | None = None,
     warnings: list[str],
     sleep_fn: SleepFn = time.sleep,
@@ -409,6 +447,7 @@ def _transcribe_in_chunks(
                     chunk_path,
                     settings=settings,
                     semaphore=semaphore,
+                    rate_limiter=rate_limiter,
                     chunk_label=label,
                     fallback_duration=spec.duration_seconds,
                     progress_callback=progress_callback,
@@ -472,6 +511,7 @@ def transcribe_audio_file(
     source_recording: str,
     progress_callback: ProgressCallback | None = None,
     client_factory: GroqClientFactory | None = None,
+    rate_limiter: OutboundRateLimiter | None = None,
     sleep_fn: SleepFn = time.sleep,
     duration_seconds: float | None = None,
 ) -> tuple[TranscriptArtifact, list[str], int]:
@@ -502,6 +542,17 @@ def transcribe_audio_file(
     factory = client_factory or _default_groq_client_factory
     client = factory(settings)
     semaphore = _get_global_transcribe_semaphore(settings.transcribe_global_max_concurrent)
+    transcribe_rpm = max(0, int(getattr(settings, "transcribe_rate_limit_rpm", 0)))
+    if rate_limiter is not None:
+        resolved_rate_limiter: OutboundRateLimiter | None = rate_limiter
+    elif client_factory is not None:
+        resolved_rate_limiter = (
+            OutboundRateLimiter(max_requests=transcribe_rpm, window_seconds=60.0)
+            if transcribe_rpm > 0
+            else None
+        )
+    else:
+        resolved_rate_limiter = _get_global_transcribe_rate_limiter(transcribe_rpm)
     warnings: list[str] = []
 
     resolved_duration = duration_seconds
@@ -517,6 +568,7 @@ def transcribe_audio_file(
                 audio_path,
                 settings=settings,
                 semaphore=semaphore,
+                rate_limiter=resolved_rate_limiter,
                 fallback_duration=resolved_duration or 0.0,
                 progress_callback=progress_callback,
                 warnings=warnings,
@@ -580,6 +632,7 @@ def transcribe_audio_file(
         ffmpeg_bin=binaries.ffmpeg,
         settings=settings,
         semaphore=semaphore,
+        rate_limiter=resolved_rate_limiter,
         progress_callback=progress_callback,
         warnings=warnings,
         sleep_fn=sleep_fn,

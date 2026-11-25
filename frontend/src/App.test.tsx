@@ -4,10 +4,14 @@ import { App } from './App'
 import { HISTORY_STORAGE_KEY } from './history'
 import type { JobCreateResponse, JobStatusResponse } from './types'
 
-function mockJsonResponse(body: unknown, status = 200): Response {
+function mockJsonResponse(
+  body: unknown,
+  status = 200,
+  extraHeaders: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...extraHeaders },
   })
 }
 
@@ -413,5 +417,70 @@ describe('slidenoteLM App', () => {
     expect(await screen.findByLabelText('Password')).toBeInTheDocument()
     expect(screen.getByRole('alert')).toHaveTextContent(/session expired/i)
     expect(screen.queryByLabelText('Video / Audio file input')).not.toBeInTheDocument()
+  })
+
+  it('respects Retry-After on HTTP 429 during job polling and surfaces rate-limit messages', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    window.history.replaceState({}, '', '/jobs/tok_rate_limited')
+
+    const completedStatus = makeJobStatus({
+      token: 'tok_rate_limited',
+      result_url: '/jobs/tok_rate_limited',
+      status: 'completed',
+      current_stage: 'notes',
+      current_stage_label: 'Markdown Notes',
+      progress_pct: 100,
+      download_ready: true,
+      download_url: '/api/jobs/tok_rate_limited/download',
+      download_filename: 'lecture-01-notes.md',
+    })
+
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse(AUTH_DISABLED, 200))
+      .mockResolvedValueOnce(
+        mockJsonResponse(
+          { detail: 'Rate limit exceeded. Please try again in 8 second(s).' },
+          429,
+          { 'Retry-After': '8' },
+        ),
+      )
+      .mockResolvedValueOnce(mockJsonResponse(completedStatus, 200))
+
+    render(<App />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/rate limit exceeded/i)
+
+    // After 4s (< 8s Retry-After), polling must still wait
+    const callsAfter429 = fetchMock.mock.calls.length
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4000)
+    })
+    expect(fetchMock.mock.calls.length).toBe(callsAfter429)
+
+    // After the full 8s Retry-After elapses, polling resumes and succeeds
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(4500)
+    })
+    expect(await screen.findByRole('link', { name: 'Download .md' })).toBeInTheDocument()
+  })
+
+  it('shows rate-limit error message when login or upload returns 429', async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockJsonResponse(AUTH_LOCKED, 200))
+      .mockResolvedValueOnce(
+        mockJsonResponse(
+          { detail: 'Rate limit exceeded. Please try again in 15 second(s).' },
+          429,
+          { 'Retry-After': '15' },
+        ),
+      )
+
+    render(<App />)
+
+    const passwordInput = await screen.findByLabelText('Password')
+    fireEvent.change(passwordInput, { target: { value: 'guess' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Unlock' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/15 second/i)
   })
 })

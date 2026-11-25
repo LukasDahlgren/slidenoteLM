@@ -181,11 +181,18 @@ export function App() {
               : 'Network error while fetching job status.'
         setPollError(message)
 
-        // Retry transient errors, but stop on 404 Not Found.
+        // Retry transient errors, honoring Retry-After on 429, and stop on 404 Not Found.
         if (!(err instanceof ApiError && err.status === 404)) {
+          const retryDelayMs =
+            err instanceof ApiError && err.status === 429
+              ? Math.min(
+                  60_000,
+                  Math.max(POLL_INTERVAL_MS * 2, (err.retryAfterSeconds ?? 5) * 1000),
+                )
+              : POLL_INTERVAL_MS * 2
           timerId = window.setTimeout(() => {
             void poll()
-          }, POLL_INTERVAL_MS * 2)
+          }, retryDelayMs)
         }
       }
     }

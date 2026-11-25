@@ -2,12 +2,47 @@ import type { AuthStatusResponse, JobCreateResponse, JobStatusResponse } from '.
 
 export class ApiError extends Error {
   status: number
+  retryAfterSeconds: number | null
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, retryAfterSeconds: number | null = null) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.retryAfterSeconds = retryAfterSeconds
   }
+}
+
+function parseRetryAfterSeconds(response: Response): number | null {
+  const raw = response.headers.get('retry-after')
+  if (!raw) return null
+  const trimmed = raw.trim()
+  if (!trimmed) return null
+
+  const numeric = Number(trimmed)
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return Math.ceil(numeric)
+  }
+
+  const parsedDate = Date.parse(trimmed)
+  if (!Number.isNaN(parsedDate)) {
+    const deltaSeconds = Math.ceil((parsedDate - Date.now()) / 1000)
+    if (deltaSeconds > 0) return deltaSeconds
+  }
+
+  return null
+}
+
+function withRateLimitFallback(
+  response: Response,
+  fallback: string,
+  retryAfterSeconds: number | null,
+): string {
+  if (response.status === 429) {
+    return retryAfterSeconds
+      ? `Too many requests. Please try again in ${retryAfterSeconds} second(s).`
+      : 'Too many requests. Please wait a moment and try again.'
+  }
+  return fallback
 }
 
 async function parseErrorMessage(response: Response, fallback: string): Promise<string> {
@@ -49,11 +84,16 @@ export async function getAuthStatus(): Promise<AuthStatusResponse> {
   })
 
   if (!response.ok) {
+    const retryAfterSeconds = parseRetryAfterSeconds(response)
     const message = await parseErrorMessage(
       response,
-      `Failed to check authentication status (HTTP ${response.status}).`,
+      withRateLimitFallback(
+        response,
+        `Failed to check authentication status (HTTP ${response.status}).`,
+        retryAfterSeconds,
+      ),
     )
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, retryAfterSeconds)
   }
 
   return (await response.json()) as AuthStatusResponse
@@ -71,13 +111,18 @@ export async function loginWithPassword(password: string): Promise<AuthStatusRes
   })
 
   if (!response.ok) {
+    const retryAfterSeconds = parseRetryAfterSeconds(response)
     const message = await parseErrorMessage(
       response,
-      response.status === 401
-        ? 'Invalid password.'
-        : `Sign-in failed (HTTP ${response.status}).`,
+      withRateLimitFallback(
+        response,
+        response.status === 401
+          ? 'Invalid password.'
+          : `Sign-in failed (HTTP ${response.status}).`,
+        retryAfterSeconds,
+      ),
     )
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, retryAfterSeconds)
   }
 
   return (await response.json()) as AuthStatusResponse
@@ -91,11 +136,16 @@ export async function logout(): Promise<AuthStatusResponse> {
   })
 
   if (!response.ok) {
+    const retryAfterSeconds = parseRetryAfterSeconds(response)
     const message = await parseErrorMessage(
       response,
-      `Sign-out failed (HTTP ${response.status}).`,
+      withRateLimitFallback(
+        response,
+        `Sign-out failed (HTTP ${response.status}).`,
+        retryAfterSeconds,
+      ),
     )
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, retryAfterSeconds)
   }
 
   return (await response.json()) as AuthStatusResponse
@@ -113,11 +163,16 @@ export async function createJob(slides: File, recording: File): Promise<JobCreat
   })
 
   if (!response.ok) {
+    const retryAfterSeconds = parseRetryAfterSeconds(response)
     const message = await parseErrorMessage(
       response,
-      `Upload failed (HTTP ${response.status}). Please check your files and try again.`,
+      withRateLimitFallback(
+        response,
+        `Upload failed (HTTP ${response.status}). Please check your files and try again.`,
+        retryAfterSeconds,
+      ),
     )
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, retryAfterSeconds)
   }
 
   return (await response.json()) as JobCreateResponse
@@ -131,13 +186,18 @@ export async function getJobStatus(token: string): Promise<JobStatusResponse> {
   })
 
   if (!response.ok) {
+    const retryAfterSeconds = parseRetryAfterSeconds(response)
     const message = await parseErrorMessage(
       response,
-      response.status === 404
-        ? 'Job not found. Check that the link is complete.'
-        : `Failed to fetch job status (HTTP ${response.status}).`,
+      withRateLimitFallback(
+        response,
+        response.status === 404
+          ? 'Job not found. Check that the link is complete.'
+          : `Failed to fetch job status (HTTP ${response.status}).`,
+        retryAfterSeconds,
+      ),
     )
-    throw new ApiError(message, response.status)
+    throw new ApiError(message, response.status, retryAfterSeconds)
   }
 
   return (await response.json()) as JobStatusResponse

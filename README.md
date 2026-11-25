@@ -93,6 +93,17 @@ The repository includes a multi-stage [`Dockerfile`](./Dockerfile) and [`railway
 4. **Custom domain with Cloudflare (important for large recordings):**
    - If you route a custom domain through Cloudflare, set the DNS record to **DNS only (grey cloud)** instead of Proxied (orange cloud). Cloudflare Free enforces a **100 MB** upload body limit that would reject larger lecture videos, whereas DNS-only lets uploads go straight to Railway.
 
+## API Rate Limits
+
+All `/api/*` endpoints use a built-in per-IP sliding-window rate limiter (emitting `X-RateLimit-*` and `Retry-After` headers), and outbound Groq Whisper / Google Gemini calls include configurable RPM pacing. Defaults (per 60s window) can be tuned or disabled (`0` or `RATE_LIMIT_ENABLED=false`) via environment variables documented in [`.env.example`](./.env.example):
+
+- `POST /api/auth/login`: `10/min` (`RATE_LIMIT_AUTH_LOGIN_PER_MINUTE`)
+- `/api/auth/*`: `60/min` (`RATE_LIMIT_AUTH_PER_MINUTE`)
+- `POST /api/jobs`: `10/min` (`RATE_LIMIT_JOBS_CREATE_PER_MINUTE`)
+- `GET /api/jobs/*` (status, preview, download): `120/min` (`RATE_LIMIT_JOBS_READ_PER_MINUTE`)
+- `GET /api/health` & other `/api/*`: `120/min` (`RATE_LIMIT_HEALTH_PER_MINUTE`, `RATE_LIMIT_DEFAULT_PER_MINUTE`)
+- Outbound Groq / Gemini pacing: `20 RPM` each (`TRANSCRIBE_RATE_LIMIT_RPM`, `OCR_RATE_LIMIT_RPM`)
+
 ## Status
 
 Phases 0–4 are implemented (repo setup + `ffmpeg`/`ffprobe`, FastAPI + SQLite background job skeleton, FFmpeg audio normalization + chunked parallel Groq Whisper transcription, strict Google Gemini Slide OCR with PyMuPDF batching, and alignment quality checks + AI-first NotebookLM Markdown scaffolding with deterministic stub mode). Follow [PLAN.md](./PLAN.md) for Phases 5–6.

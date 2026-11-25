@@ -20,6 +20,7 @@ from google import genai
 from google.genai import types
 
 from ..config import Settings
+from ..ratelimit import OutboundRateLimiter
 from ..schemas import (
     ARTIFACT_SLIDES_OCR,
     JobContext,
@@ -42,6 +43,7 @@ DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # Safely below Gemini's 20 MB in
 DEFAULT_OCR_PARALLEL_WORKERS = 2
 DEFAULT_OCR_PARALLEL_MIN_PAGES = 4
 DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 4
+DEFAULT_OCR_RATE_LIMIT_RPM = 20
 DEFAULT_OCR_RETRY_ATTEMPTS = 3
 DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS = 2.0
 DEFAULT_OCR_TIMEOUT_SECONDS = 180.0
@@ -75,6 +77,8 @@ _MAX_RETRY_AFTER_SECONDS = 60.0
 
 _semaphore_lock = threading.Lock()
 _global_ocr_semaphores: dict[int, threading.BoundedSemaphore] = {}
+_rate_limiter_lock = threading.Lock()
+_global_ocr_rate_limiters: dict[int, OutboundRateLimiter] = {}
 
 
 @dataclass(frozen=True)
@@ -149,6 +153,18 @@ def _get_global_ocr_semaphore(max_concurrent: int) -> threading.BoundedSemaphore
             semaphore = threading.BoundedSemaphore(limit)
             _global_ocr_semaphores[limit] = semaphore
         return semaphore
+
+
+def _get_global_ocr_rate_limiter(max_rpm: int) -> OutboundRateLimiter | None:
+    limit = max(0, int(max_rpm))
+    if limit <= 0:
+        return None
+    with _rate_limiter_lock:
+        limiter = _global_ocr_rate_limiters.get(limit)
+        if limiter is None:
+            limiter = OutboundRateLimiter(max_requests=limit, window_seconds=60.0)
+            _global_ocr_rate_limiters[limit] = limiter
+        return limiter
 
 
 def validate_gemini_credentials(settings: Settings) -> None:
@@ -1003,6 +1019,10 @@ def _ocr_single_batch_once(
     model: str,
     max_output_tokens: int,
     semaphore: threading.BoundedSemaphore,
+    rate_limiter: OutboundRateLimiter | None = None,
+    batch_label: str = "",
+    progress_callback: ProgressCallback | None = None,
+    sleep_fn: SleepFn = time.sleep,
 ) -> tuple[list[dict[str, Any]], int, int]:
     prompt = build_ocr_prompt(batch_payload.spec.page_count)
     pdf_part = types.Part.from_bytes(
@@ -1014,6 +1034,19 @@ def _ocr_single_batch_once(
         max_output_tokens=max_output_tokens,
         response_mime_type="application/json",
     )
+
+    if rate_limiter is not None:
+        def _notify_wait(wait_seconds: float) -> None:
+            wait_msg = (
+                f"Gemini OCR rate limit pacing ({batch_label}); waiting {wait_seconds:.1f}s..."
+                if batch_label
+                else f"Gemini OCR rate limit pacing; waiting {wait_seconds:.1f}s..."
+            )
+            logger.info("%s", wait_msg)
+            if progress_callback is not None:
+                progress_callback(wait_msg)
+
+        rate_limiter.acquire(sleep_fn=sleep_fn, on_wait=_notify_wait)
 
     with semaphore:
         response = client.models.generate_content(
@@ -1048,6 +1081,7 @@ def _ocr_single_batch_with_retries(
     settings: Settings,
     model: str,
     semaphore: threading.BoundedSemaphore,
+    rate_limiter: OutboundRateLimiter | None = None,
     progress_callback: ProgressCallback | None = None,
     warnings: list[str] | None = None,
     warnings_lock: threading.Lock | None = None,
@@ -1090,6 +1124,10 @@ def _ocr_single_batch_with_retries(
                 model=model,
                 max_output_tokens=max_output_tokens,
                 semaphore=semaphore,
+                rate_limiter=rate_limiter,
+                batch_label=batch_label,
+                progress_callback=progress_callback,
+                sleep_fn=sleep_fn,
             )
             normalized_slides, mismatch_warning = normalize_batch_slides(
                 raw_slides,
@@ -1175,6 +1213,7 @@ def extract_slides_with_gemini_ocr(
     source_pdf: str,
     progress_callback: ProgressCallback | None = None,
     client_factory: GenAIClientFactory | None = None,
+    rate_limiter: OutboundRateLimiter | None = None,
     sleep_fn: SleepFn = time.sleep,
 ) -> tuple[SlidesOCRArtifact, list[str], dict[str, int]]:
     """Run strict Google Gemini OCR across a slide PDF and return the structured artifact."""
@@ -1236,6 +1275,22 @@ def extract_slides_with_gemini_ocr(
         ) from exc
 
     semaphore = _get_global_ocr_semaphore(global_max_concurrent)
+    ocr_rate_limit_rpm = _get_setting_int(
+        settings,
+        "ocr_rate_limit_rpm",
+        DEFAULT_OCR_RATE_LIMIT_RPM,
+        minimum=0,
+    )
+    if rate_limiter is not None:
+        resolved_rate_limiter: OutboundRateLimiter | None = rate_limiter
+    elif client_factory is not None:
+        resolved_rate_limiter = (
+            OutboundRateLimiter(max_requests=ocr_rate_limit_rpm, window_seconds=60.0)
+            if ocr_rate_limit_rpm > 0
+            else None
+        )
+    else:
+        resolved_rate_limiter = _get_global_ocr_rate_limiter(ocr_rate_limit_rpm)
     warnings: list[str] = []
     warnings_lock = threading.Lock()
     progress_lock = threading.Lock()
@@ -1261,6 +1316,7 @@ def extract_slides_with_gemini_ocr(
             settings=settings,
             model=model,
             semaphore=semaphore,
+            rate_limiter=resolved_rate_limiter,
             progress_callback=progress_callback,
             warnings=warnings,
             warnings_lock=warnings_lock,
