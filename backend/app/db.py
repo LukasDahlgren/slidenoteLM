@@ -10,6 +10,7 @@ from typing import Any, Iterator
 
 from .schemas import PIPELINE_STAGES, PipelineStage
 
+SCHEMA_VERSION = 2
 INTERRUPTED_MESSAGE = "Processing was interrupted because the server restarted."
 INTERRUPTED_HINT = "Start a new upload to re-run this lecture."
 
@@ -24,7 +25,7 @@ def generate_job_token() -> str:
 
 
 class JobStore:
-    """SQLite-backed persistence for jobs, per-stage history, errors, and artifacts."""
+    """SQLite-backed persistence for jobs, per-stage history, errors, artifacts, and stats."""
 
     def __init__(self, db_path: Path) -> None:
         self.db_path = Path(db_path)
@@ -57,6 +58,8 @@ class JobStore:
                     recording_filename TEXT NOT NULL,
                     job_dir TEXT NOT NULL,
                     artifacts_json TEXT NOT NULL DEFAULT '{}',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    warnings_json TEXT NOT NULL DEFAULT '[]',
                     error_stage TEXT,
                     error_message TEXT,
                     error_hint TEXT,
@@ -82,6 +85,18 @@ class JobStore:
                     ON job_stages(job_token, stage_order);
                 """
             )
+            self._migrate_schema(conn)
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"]) for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "metadata_json" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+        if "warnings_json" not in columns:
+            conn.execute("ALTER TABLE jobs ADD COLUMN warnings_json TEXT NOT NULL DEFAULT '[]'")
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def create_job(
         self,
@@ -107,10 +122,12 @@ class JobStore:
                     recording_filename,
                     job_dir,
                     artifacts_json,
+                    metadata_json,
+                    warnings_json,
                     created_at,
                     updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '{}', '[]', ?, ?)
                 """,
                 (
                     resolved_token,
@@ -224,6 +241,26 @@ class JobStore:
                 (message, now, token, stage),
             )
 
+    def update_stage_message(self, token: str, stage: PipelineStage, message: str) -> None:
+        """Update the live status message for a running stage."""
+        cleaned = message.strip()
+        if not cleaned:
+            return
+        now = utc_now_iso()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE job_stages
+                SET message = ?
+                WHERE job_token = ? AND stage = ?
+                """,
+                (cleaned, token, stage),
+            )
+            conn.execute(
+                "UPDATE jobs SET updated_at = ? WHERE token = ?",
+                (now, token),
+            )
+
     def complete_stage(
         self,
         token: str,
@@ -231,22 +268,42 @@ class JobStore:
         *,
         message: str | None = None,
         artifacts: dict[str, str] | None = None,
+        stats: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
     ) -> None:
         now = utc_now_iso()
         with self._connect() as conn:
-            merged_artifacts = self._load_artifacts_locked(conn, token)
+            merged_artifacts = self._load_json_dict_locked(conn, token, "artifacts_json")
             if artifacts:
                 merged_artifacts.update(artifacts)
+
+            merged_stats = self._load_json_dict_locked(conn, token, "metadata_json")
+            if stats:
+                merged_stats.update(stats)
+
+            merged_warnings = self._merge_warnings(
+                self._load_json_list_locked(conn, token, "warnings_json"),
+                warnings,
+            )
 
             conn.execute(
                 """
                 UPDATE jobs
                 SET current_stage = ?,
                     artifacts_json = ?,
+                    metadata_json = ?,
+                    warnings_json = ?,
                     updated_at = ?
                 WHERE token = ?
                 """,
-                (stage, json.dumps(merged_artifacts, sort_keys=True), now, token),
+                (
+                    stage,
+                    json.dumps(merged_artifacts, sort_keys=True),
+                    json.dumps(merged_stats, sort_keys=True),
+                    json.dumps(merged_warnings),
+                    now,
+                    token,
+                ),
             )
             conn.execute(
                 """
@@ -265,12 +322,23 @@ class JobStore:
         token: str,
         *,
         artifacts: dict[str, str] | None = None,
+        stats: dict[str, Any] | None = None,
+        warnings: list[str] | None = None,
     ) -> None:
         now = utc_now_iso()
         with self._connect() as conn:
-            merged_artifacts = self._load_artifacts_locked(conn, token)
+            merged_artifacts = self._load_json_dict_locked(conn, token, "artifacts_json")
             if artifacts:
                 merged_artifacts.update(artifacts)
+
+            merged_stats = self._load_json_dict_locked(conn, token, "metadata_json")
+            if stats:
+                merged_stats.update(stats)
+
+            merged_warnings = self._merge_warnings(
+                self._load_json_list_locked(conn, token, "warnings_json"),
+                warnings,
+            )
 
             conn.execute(
                 """
@@ -278,6 +346,8 @@ class JobStore:
                 SET status = 'completed',
                     current_stage = 'notes',
                     artifacts_json = ?,
+                    metadata_json = ?,
+                    warnings_json = ?,
                     error_stage = NULL,
                     error_message = NULL,
                     error_hint = NULL,
@@ -285,7 +355,14 @@ class JobStore:
                     completed_at = ?
                 WHERE token = ?
                 """,
-                (json.dumps(merged_artifacts, sort_keys=True), now, now, token),
+                (
+                    json.dumps(merged_artifacts, sort_keys=True),
+                    json.dumps(merged_stats, sort_keys=True),
+                    json.dumps(merged_warnings),
+                    now,
+                    now,
+                    token,
+                ),
             )
 
     def mark_job_failed(
@@ -405,24 +482,65 @@ class JobStore:
         return len(rows)
 
     @staticmethod
-    def _load_artifacts_locked(conn: sqlite3.Connection, token: str) -> dict[str, str]:
-        row = conn.execute(
-            "SELECT artifacts_json FROM jobs WHERE token = ?", (token,)
-        ).fetchone()
-        if row is None or not row["artifacts_json"]:
+    def _load_json_dict_locked(
+        conn: sqlite3.Connection,
+        token: str,
+        column: str,
+    ) -> dict[str, Any]:
+        row = conn.execute(f"SELECT {column} FROM jobs WHERE token = ?", (token,)).fetchone()
+        if row is None or not row[column]:
             return {}
         try:
-            loaded = json.loads(row["artifacts_json"])
+            loaded = json.loads(row[column])
         except json.JSONDecodeError:
             return {}
         return dict(loaded) if isinstance(loaded, dict) else {}
 
     @staticmethod
-    def _row_to_job(row: sqlite3.Row, stage_rows: list[sqlite3.Row]) -> dict[str, Any]:
+    def _load_json_list_locked(
+        conn: sqlite3.Connection,
+        token: str,
+        column: str,
+    ) -> list[str]:
+        row = conn.execute(f"SELECT {column} FROM jobs WHERE token = ?", (token,)).fetchone()
+        if row is None or not row[column]:
+            return []
         try:
-            artifacts = json.loads(row["artifacts_json"] or "{}")
+            loaded = json.loads(row[column])
         except json.JSONDecodeError:
-            artifacts = {}
+            return []
+        if not isinstance(loaded, list):
+            return []
+        return [str(item) for item in loaded if str(item).strip()]
+
+    @staticmethod
+    def _merge_warnings(existing: list[str], incoming: list[str] | None) -> list[str]:
+        merged = list(existing)
+        if not incoming:
+            return merged
+        for warning in incoming:
+            cleaned = str(warning).strip()
+            if cleaned and cleaned not in merged:
+                merged.append(cleaned)
+        return merged
+
+    @staticmethod
+    def _row_to_job(row: sqlite3.Row, stage_rows: list[sqlite3.Row]) -> dict[str, Any]:
+        def _parse_dict(raw: Any) -> dict[str, Any]:
+            try:
+                loaded = json.loads(raw or "{}")
+            except json.JSONDecodeError:
+                return {}
+            return loaded if isinstance(loaded, dict) else {}
+
+        def _parse_list(raw: Any) -> list[str]:
+            try:
+                loaded = json.loads(raw or "[]")
+            except json.JSONDecodeError:
+                return []
+            if not isinstance(loaded, list):
+                return []
+            return [str(item) for item in loaded if str(item).strip()]
 
         return {
             "token": row["token"],
@@ -431,7 +549,9 @@ class JobStore:
             "slides_filename": row["slides_filename"],
             "recording_filename": row["recording_filename"],
             "job_dir": row["job_dir"],
-            "artifacts": artifacts if isinstance(artifacts, dict) else {},
+            "artifacts": _parse_dict(row["artifacts_json"]),
+            "stats": _parse_dict(row["metadata_json"]),
+            "warnings": _parse_list(row["warnings_json"]),
             "error_stage": row["error_stage"],
             "error_message": row["error_message"],
             "error_hint": row["error_hint"],
