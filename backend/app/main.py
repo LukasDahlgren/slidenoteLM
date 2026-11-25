@@ -12,20 +12,26 @@ from fastapi.responses import FileResponse
 
 from .config import Settings, load_settings
 from .db import JobStore, generate_job_token
+from .pipeline import StageHandler
 from .schemas import (
+    ARTIFACT_SLIDES_PDF,
     PIPELINE_STAGES,
     STAGE_LABELS,
     HealthResponse,
     JobCreateResponse,
     JobErrorResponse,
+    JobPreviewResponse,
+    JobStatsResponse,
     JobStatusResponse,
     PipelineStage,
     StageStateResponse,
 )
-from .worker import JobWorker, StageHandler
+from .worker import JobWorker
 
 UPLOAD_CHUNK_BYTES = 1024 * 1024  # 1 MiB
 PDF_MAGIC_HEADER = b"%PDF-"
+PDF_HEADER_SCAN_BYTES = 1024
+PREVIEW_MAX_CHARS = 50_000
 _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -84,8 +90,8 @@ async def _save_upload_file(
     require_pdf_header: bool = False,
 ) -> int:
     total_bytes = 0
-    header_checked = not require_pdf_header
-    header_buffer = bytearray()
+    header_found = not require_pdf_header
+    header_window = bytearray()
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     with destination.open("wb") as out_file:
@@ -101,15 +107,17 @@ async def _save_upload_file(
                     detail=f"{label} exceeds the maximum allowed size of {max_bytes} bytes.",
                 )
 
-            if not header_checked:
-                header_buffer.extend(chunk[: len(PDF_MAGIC_HEADER) - len(header_buffer)])
-                if len(header_buffer) >= len(PDF_MAGIC_HEADER):
-                    if bytes(header_buffer) != PDF_MAGIC_HEADER:
+            if not header_found:
+                remaining = PDF_HEADER_SCAN_BYTES - len(header_window)
+                if remaining > 0:
+                    header_window.extend(chunk[:remaining])
+                    if PDF_MAGIC_HEADER in header_window:
+                        header_found = True
+                    elif len(header_window) >= PDF_HEADER_SCAN_BYTES:
                         raise HTTPException(
                             status_code=status.HTTP_400_BAD_REQUEST,
                             detail="Uploaded slides file is not a valid PDF document.",
                         )
-                    header_checked = True
 
             out_file.write(chunk)
 
@@ -119,7 +127,7 @@ async def _save_upload_file(
             detail=f"{label} is empty. Please upload a non-empty file.",
         )
 
-    if require_pdf_header and not header_checked:
+    if require_pdf_header and not header_found:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Uploaded slides file is not a valid PDF document.",
@@ -180,7 +188,38 @@ def _job_to_status_response(job: dict) -> JobStatusResponse:
         stages=stages,
         error=error,
         artifacts=dict(job.get("artifacts") or {}),
+        stats=JobStatsResponse.model_validate(job.get("stats") or {}),
+        warnings=list(job.get("warnings") or []),
     )
+
+
+def _require_completed_notes_path(store: JobStore, token: str) -> tuple[dict, Path]:
+    job = store.get_job(token)
+    if job is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Job not found. Check that your private result link is complete.",
+        )
+
+    if job["status"] != "completed":
+        if job["status"] == "failed":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Processing failed before Markdown notes were generated.",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Markdown notes are not ready yet. Wait for processing to complete.",
+        )
+
+    notes_path = _resolve_notes_path(job)
+    if notes_path is None or not notes_path.is_file():
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Generated notes file could not be found on disk.",
+        )
+
+    return job, notes_path
 
 
 def create_app(
@@ -213,7 +252,7 @@ def create_app(
 
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=[resolved_settings.frontend_origin],
+        allow_origins=list(resolved_settings.frontend_origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -259,7 +298,7 @@ def create_app(
 
         token = generate_job_token()
         job_dir = resolved_settings.jobs_dir / token
-        slides_rel = "input/slides.pdf"
+        slides_rel = ARTIFACT_SLIDES_PDF
         recording_rel = f"input/recording{recording_ext}"
 
         try:
@@ -317,33 +356,23 @@ def create_app(
             )
         return _job_to_status_response(job)
 
+    @application.get("/api/jobs/{token}/preview", response_model=JobPreviewResponse)
+    def preview_notes(token: str) -> JobPreviewResponse:
+        job, notes_path = _require_completed_notes_path(store, token)
+        full_text = notes_path.read_text(encoding="utf-8")
+        truncated = len(full_text) > PREVIEW_MAX_CHARS
+        content = full_text[:PREVIEW_MAX_CHARS] if truncated else full_text
+        return JobPreviewResponse(
+            token=token,
+            filename=build_download_filename(str(job["slides_filename"])),
+            content=content,
+            word_count=len(full_text.split()),
+            truncated=truncated,
+        )
+
     @application.get("/api/jobs/{token}/download")
     def download_notes(token: str) -> FileResponse:
-        job = store.get_job(token)
-        if job is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Job not found. Check that your private result link is complete.",
-            )
-
-        if job["status"] != "completed":
-            if job["status"] == "failed":
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Processing failed before Markdown notes were generated.",
-                )
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Markdown notes are not ready yet. Wait for processing to complete.",
-            )
-
-        notes_path = _resolve_notes_path(job)
-        if notes_path is None or not notes_path.is_file():
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Generated notes file could not be found on disk.",
-            )
-
+        job, notes_path = _require_completed_notes_path(store, token)
         return FileResponse(
             path=notes_path,
             media_type="text/markdown; charset=utf-8",
