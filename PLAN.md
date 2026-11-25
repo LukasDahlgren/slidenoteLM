@@ -75,17 +75,17 @@ slidenoteLM/
 - [x] Create local Python `.venv`, install backend dependencies (`fastapi`, `uvicorn`, `groq`, `google-genai`, `pymupdf`, `httpx`), and install frontend dependencies (`react`, `vite`, `typescript`, `eslint`, `vitest`).
 - [ ] Ensure `ffmpeg` (and `ffprobe`) is installed and available on `PATH` before Phase 2.
 
-### Phase 1 — Backend Skeleton, SQLite Job Store & Upload API
+### Phase 1 — Backend Skeleton, SQLite Job Store & Upload API *(Completed)*
 **Goal:** Accept one PDF + one audio/video upload, persist a job with a private unguessable token, run stages asynchronously in the background, and serve job status and `.md` downloads.
-- [ ] Implement `backend/app/config.py` (data directory, env vars, limits) and `backend/app/db.py` (SQLite tables for jobs, stages, status, timestamps, error stage + actionable hint, artifact paths).
-- [ ] Generate high-entropy private job tokens (`secrets.token_urlsafe(24)`) used for `/jobs/<token>` result links.
-- [ ] Implement FastAPI endpoints in `backend/app/main.py`:
+- [x] Implement `backend/app/config.py` (data directory, env vars, limits) and `backend/app/db.py` (SQLite tables for jobs, stages, status, timestamps, error stage + actionable hint, artifact paths).
+- [x] Generate high-entropy private job tokens (`secrets.token_urlsafe(24)`) used for `/jobs/<token>` result links.
+- [x] Implement FastAPI endpoints in `backend/app/main.py`:
   - `GET /api/health`
   - `POST /api/jobs` (multipart upload: 1 PDF + 1 audio/video file, returns `{token, result_url, status}`)
   - `GET /api/jobs/{token}` (current stage, stage history/progress, error stage + next step if failed, download readiness)
   - `GET /api/jobs/{token}/download` (streams `notes.md` with clean filename)
-- [ ] Implement `backend/app/worker.py` so processing runs in the background after upload finishes and survives closing the browser tab. Mark interrupted in-progress jobs clearly on restart.
-- [ ] Add unit/API tests covering upload validation, token lookup, background state transitions, and failure reporting.
+- [x] Implement `backend/app/worker.py` so processing runs in the background after upload finishes and survives closing the browser tab. Mark interrupted in-progress jobs clearly on restart.
+- [x] Add unit/API tests covering upload validation, token lookup, background state transitions, and failure reporting.
 
 ### Phase 2 — Audio Prep & Groq Whisper Transcription
 **Goal:** Turn any uploaded audio or video recording into accurate, timestamped `transcript.json`.
