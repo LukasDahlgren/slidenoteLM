@@ -85,9 +85,36 @@ try {
         exit 1
     }
 
+    if ([Environment]::GetEnvironmentVariable("BWS_ACCESS_TOKEN", "User") -or [Environment]::GetEnvironmentVariable("BWS_ACCESS_TOKEN", "Machine")) {
+        Write-Warning "BWS_ACCESS_TOKEN is stored as a persistent Windows environment variable, so every process can read it. Remove it with: [Environment]::SetEnvironmentVariable('BWS_ACCESS_TOKEN', `$null, 'User')"
+    }
+
+    $bwsTokenPattern = '^0\.[^.:\s]+\.[^:\s]+:\S+$'
+
+    if ($env:BWS_ACCESS_TOKEN -and ($env:BWS_ACCESS_TOKEN -notmatch $bwsTokenPattern)) {
+        Write-Warning "Ignoring malformed BWS_ACCESS_TOKEN in current terminal session."
+        Remove-Item Env:BWS_ACCESS_TOKEN -ErrorAction SilentlyContinue
+    }
+
     if (-not $env:BWS_ACCESS_TOKEN) {
-        Write-Error "BWS_ACCESS_TOKEN is not set. Set it as a Windows User environment variable (not inside .env) and reopen your terminal."
-        exit 1
+        $secureToken = Read-Host -Prompt "Enter BWS_ACCESS_TOKEN (hidden; right-click or Ctrl+Shift+V to paste)" -AsSecureString
+        $token = ""
+        if ($null -ne $secureToken) {
+            try {
+                $token = (New-Object System.Net.NetworkCredential("", $secureToken)).Password.Trim()
+            } finally {
+                $secureToken.Dispose()
+            }
+        }
+        if (-not $token) {
+            Write-Error "BWS_ACCESS_TOKEN is required (or run with -SkipBws to use .env / stub mode)."
+            exit 1
+        }
+        if ($token -notmatch $bwsTokenPattern) {
+            Write-Error "Invalid BWS_ACCESS_TOKEN format (expected '0.<uuid>.<secret>:<key>'). Tip: in PowerShell hidden prompts, paste with right-click or Ctrl+Shift+V (Ctrl+V can send a single control character)."
+            exit 1
+        }
+        $env:BWS_ACCESS_TOKEN = $token
     }
 
     if (-not $ProjectId) {
