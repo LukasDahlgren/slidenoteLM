@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Callable, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 JobStatus = Literal["queued", "processing", "completed", "failed"]
 StageStatus = Literal["pending", "running", "completed", "failed"]
@@ -43,6 +43,16 @@ STAGE_LABELS: dict[PipelineStage, str] = {
     "notes": "Markdown Notes",
 }
 
+# Canonical job-relative artifact paths shared across pipeline stages.
+ARTIFACT_SLIDES_PDF = "input/slides.pdf"
+ARTIFACT_AUDIO_NORMALIZED = "artifacts/audio_normalized.mp3"
+ARTIFACT_TRANSCRIPT = "artifacts/transcript.json"
+ARTIFACT_SLIDES_OCR = "artifacts/slides_ocr.json"
+ARTIFACT_ALIGNMENT = "artifacts/alignment.json"
+ARTIFACT_NOTES_MD = "artifacts/notes.md"
+
+ProgressCallback = Callable[[str], None]
+
 
 class StageError(RuntimeError):
     """Structured pipeline failure carrying the failing stage and an actionable hint."""
@@ -65,12 +75,98 @@ class JobContext:
     slides_path: Path
     recording_path: Path
     artifacts: dict[str, str] = field(default_factory=dict)
+    progress_callback: ProgressCallback | None = field(default=None, repr=False, compare=False)
+
+    @property
+    def audio_normalized_path(self) -> Path:
+        return self.job_dir / ARTIFACT_AUDIO_NORMALIZED
+
+    @property
+    def transcript_path(self) -> Path:
+        return self.job_dir / ARTIFACT_TRANSCRIPT
+
+    @property
+    def slides_ocr_path(self) -> Path:
+        return self.job_dir / ARTIFACT_SLIDES_OCR
+
+    @property
+    def alignment_path(self) -> Path:
+        return self.job_dir / ARTIFACT_ALIGNMENT
+
+    @property
+    def notes_path(self) -> Path:
+        return self.job_dir / ARTIFACT_NOTES_MD
+
+    def report_progress(self, message: str) -> None:
+        """Emit a live status update for the currently executing stage."""
+        if self.progress_callback is not None and message.strip():
+            self.progress_callback(message.strip())
 
 
 @dataclass(frozen=True)
 class StageResult:
     message: str = ""
     artifacts: dict[str, str] = field(default_factory=dict)
+    stats: dict[str, Any] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
+
+
+# --- Persisted Pipeline Artifact Contracts (Phases 2-4) ---
+
+
+class TranscriptSegment(BaseModel):
+    index: int = Field(ge=0)
+    start: float = Field(ge=0.0)
+    end: float = Field(ge=0.0)
+    text: str
+
+
+class TranscriptArtifact(BaseModel):
+    source_recording: str
+    model: str = ""
+    duration_seconds: float | None = Field(default=None, ge=0.0)
+    segments: list[TranscriptSegment] = Field(default_factory=list)
+
+
+class SlideOCRRecord(BaseModel):
+    slide: int = Field(ge=1)
+    visible_text: str = ""
+    visual_context: str = ""
+    tables_code_formulas: str = ""
+    raw_text: str = ""
+
+
+class SlidesOCRArtifact(BaseModel):
+    source_pdf: str
+    model: str = ""
+    slide_count: int = Field(default=0, ge=0)
+    slides: list[SlideOCRRecord] = Field(default_factory=list)
+
+
+class AlignmentEntry(BaseModel):
+    slide: int | None = Field(default=None, ge=1)
+    start_segment: int = Field(ge=0)
+    end_segment: int = Field(ge=0)
+    start_time: float = Field(ge=0.0)
+    end_time: float = Field(ge=0.0)
+    uncertain: bool = False
+    reason: str = ""
+
+
+class AlignmentIssue(BaseModel):
+    code: str
+    message: str
+    slides: list[int] = Field(default_factory=list)
+    severity: Literal["warning", "error"] = "warning"
+
+
+class AlignmentArtifact(BaseModel):
+    mode: str = "stub"
+    entries: list[AlignmentEntry] = Field(default_factory=list)
+    alignment_issues: list[AlignmentIssue] = Field(default_factory=list)
+
+
+# --- HTTP API Response Models ---
 
 
 class HealthResponse(BaseModel):
@@ -103,6 +199,15 @@ class JobErrorResponse(BaseModel):
     hint: str
 
 
+class JobStatsResponse(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    duration_seconds: float | None = None
+    slide_count: int | None = None
+    transcript_segments: int | None = None
+    word_count: int | None = None
+
+
 class JobStatusResponse(BaseModel):
     token: str
     result_url: str
@@ -122,3 +227,13 @@ class JobStatusResponse(BaseModel):
     stages: list[StageStateResponse]
     error: JobErrorResponse | None = None
     artifacts: dict[str, str] = Field(default_factory=dict)
+    stats: JobStatsResponse = Field(default_factory=JobStatsResponse)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class JobPreviewResponse(BaseModel):
+    token: str
+    filename: str
+    content: str
+    word_count: int = Field(ge=0)
+    truncated: bool = False
