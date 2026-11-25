@@ -68,12 +68,12 @@ slidenoteLM/
 
 ## Phased Build Plan
 
-### Phase 0 — Repo Bootstrap & Dependencies *(Completed — pending `ffmpeg` on PATH)*
+### Phase 0 — Repo Bootstrap & Dependencies *(Completed)*
 - [x] Create standalone folder `C:\Users\lukas\code\slidenoteLM` and initialize Git repo.
 - [x] Add `.gitignore`, `.env.example`, `README.md`, and this `PLAN.md`.
 - [x] Add minimal dependency manifests (`backend/requirements.txt`, `frontend/package.json`) and basic Vite/TypeScript/ESLint config.
 - [x] Create local Python `.venv`, install backend dependencies (`fastapi`, `uvicorn`, `groq`, `google-genai`, `pymupdf`, `httpx`), and install frontend dependencies (`react`, `vite`, `typescript`, `eslint`, `vitest`).
-- [ ] Ensure `ffmpeg` (and `ffprobe`) is installed and available on `PATH` before Phase 2.
+- [x] Ensure `ffmpeg` (and `ffprobe`) is installed and available on `PATH` before Phase 2.
 
 ### Phase 1 — Backend Skeleton, SQLite Job Store & Upload API *(Completed)*
 **Goal:** Accept one PDF + one audio/video upload, persist a job with a private unguessable token, run stages asynchronously in the background, and serve job status and `.md` downloads.
@@ -87,39 +87,39 @@ slidenoteLM/
 - [x] Implement `backend/app/worker.py` so processing runs in the background after upload finishes and survives closing the browser tab. Mark interrupted in-progress jobs clearly on restart.
 - [x] Add unit/API tests covering upload validation, token lookup, background state transitions, and failure reporting.
 
-### Phase 2 — Audio Prep & Groq Whisper Transcription
+### Phase 2 — Audio Prep & Groq Whisper Transcription *(Completed)*
 **Goal:** Turn any uploaded audio or video recording into accurate, timestamped `transcript.json`.
-- [ ] Inspect TeachersNote's `backend/services/transcription_audio.py` and `backend/pipeline.py` transcription chunking for reference.
-- [ ] Implement `backend/app/pipeline/audio.py`:
+- [x] Inspect TeachersNote's `backend/services/transcription_audio.py` and `backend/pipeline.py` transcription chunking for reference.
+- [x] Implement `backend/app/pipeline/audio.py`:
   - Verify `ffmpeg`/`ffprobe` availability with a clear error message if missing.
   - Extract and normalize audio from audio or video inputs to 16 kHz mono MP3.
   - Split long recordings safely below Groq's upload byte limit with accurate timestamp offsets.
-- [ ] Implement `backend/app/pipeline/transcribe.py`:
+- [x] Implement `backend/app/pipeline/transcribe.py`:
   - Parallel Groq Whisper transcription with bounded concurrency and retry/backoff.
   - Merge chunk segments with shifted timestamps into `artifacts/transcript.json`.
-- [ ] Add unit tests (mocked `ffmpeg`/Groq + timestamp offset merging) and verify with a real sample clip if `GROQ_API_KEY` is configured.
+- [x] Add unit tests (mocked `ffmpeg`/Groq + timestamp offset merging + real `ffmpeg`/`ffprobe` integration tests; live Groq smoke test ready once `GROQ_API_KEY` is added in `.env`).
 
-### Phase 3 — Google Gemini Slide OCR (Strict OCR Only)
+### Phase 3 — Google Gemini Slide OCR (Strict OCR Only) *(Completed)*
 **Goal:** Extract rich slide text + visual diagram descriptions from the PDF into `slides_ocr.json` with **zero** `pdfplumber` fallback.
-- [ ] Inspect TeachersNote's `backend/services/parse_slides_gemini.py` and `backend/services/ocr_sections.py` for reference.
-- [ ] Implement `backend/app/pipeline/ocr.py`:
+- [x] Inspect TeachersNote's `backend/services/parse_slides_gemini.py` and `backend/services/ocr_sections.py` for reference.
+- [x] Implement `backend/app/pipeline/ocr.py`:
   - Use `pymupdf` (`fitz`) to inspect page count and slice/batch PDF pages cleanly for Gemini OCR.
   - Call `google-genai` to extract structured per-slide output (`VISIBLE_TEXT`, `VISUAL_CONTEXT`, `TABLES_CODE_FORMULAS`).
   - Strip repeating headers/footers/watermarks without losing structured markers.
   - **Strict failure policy:** If `GEMINI_API_KEY` (or Vertex config) is missing or Gemini OCR fails after retries, fail the job at the `ocr` stage with an explicit, actionable error message. Never fall back to `pdfplumber`.
-- [ ] Add unit tests (structured marker parsing, boilerplate cleanup, strict OCR failure behavior) and verify against a real PDF if Google credentials are configured.
+- [x] Add unit tests (structured marker parsing, boilerplate cleanup, strict OCR failure behavior) and verify against a real PDF if Google credentials are configured.
 
-### Phase 4 — Alignment & AI-First Markdown Scaffolding (LLM-Deferred)
+### Phase 4 — Alignment & AI-First Markdown Scaffolding (LLM-Deferred) *(Completed)*
 **Goal:** Lock in data contracts, sectioning/context carry-over logic, NotebookLM prompt specifications, and a deterministic stub mode so the full pipeline runs end-to-end before choosing the LLM provider.
-- [ ] Implement `backend/app/pipeline/align.py`:
+- [x] Implement `backend/app/pipeline/align.py`:
   - Port TeachersNote's structural alignment quality checks (`alignment_issues` / unresolved warnings) and define `alignment.json` schema.
   - Mark uncertain or out-of-order regions explicitly so downstream note generation falls back to timestamp-only anchors instead of dubious slide numbers.
   - Provide a clean hook (`align_with_llm(...)`) plus a deterministic stub mode (`PIPELINE_LLM_MODE=stub`) for end-to-end testing.
-- [ ] Implement `backend/app/pipeline/prompts.py` and `backend/app/pipeline/notes.py`:
+- [x] Implement `backend/app/pipeline/prompts.py` and `backend/app/pipeline/notes.py`:
   - Implement section chunking (grouping contiguous aligned slides/transcript segments into manageable sections, plus explicit off-slide/demo/Q&A spans) and rolling context carry-over across section boundaries.
   - Encode the full **AI-first NotebookLM Markdown Specification** (see below) in `prompts.py`, plus a **transcript coverage-check** prompt/contract to catch silently dropped explanations or Q&A.
   - Provide a clean single hook (`generate_section_notes_with_llm(...)` + `check_coverage_with_llm(...)`) and deterministic stub mode that emits valid, structured `notes.md` from `slides_ocr.json` + `transcript.json`.
-- [ ] Add unit tests for sectioning, boundary context handoff, uncertainty fallback (timestamp-only), and Markdown assembly.
+- [x] Add unit tests for sectioning, boundary context handoff, uncertainty fallback (timestamp-only), and Markdown assembly.
 
 ### Phase 5 — One-Screen Frontend UI & End-to-End Verification
 **Goal:** Deliver a clean, single-screen browser UI for Windows and Mac and verify the complete upload → background run → reopen link → download `.md` flow.

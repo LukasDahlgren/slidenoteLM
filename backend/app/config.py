@@ -29,6 +29,28 @@ DEFAULT_MAX_PDF_BYTES = 100 * 1024 * 1024  # 100 MB
 DEFAULT_MAX_RECORDING_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 DEFAULT_WORKER_CONCURRENCY = 2
 
+# Audio normalization & Groq Whisper transcription defaults
+DEFAULT_TRANSCRIBE_TARGET_BITRATE = "32k"
+DEFAULT_TRANSCRIBE_MAX_UPLOAD_BYTES = 24_000_000  # Safely below Groq's 25 MB limit
+DEFAULT_TRANSCRIBE_CHUNK_HEADROOM_PCT = 90
+DEFAULT_TRANSCRIBE_MIN_CHUNK_SECONDS = 300
+DEFAULT_TRANSCRIBE_PARALLEL_WORKERS = 4
+DEFAULT_TRANSCRIBE_GLOBAL_MAX_CONCURRENT = 6
+DEFAULT_TRANSCRIBE_RETRY_ATTEMPTS = 3
+DEFAULT_TRANSCRIBE_RETRY_BASE_DELAY_SECONDS = 3.0
+DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS = 180.0
+
+# Google Gemini Slide OCR defaults
+DEFAULT_OCR_MAX_PAGES_PER_BATCH = 20
+DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # 18 MiB (safely below Gemini's 20 MB inline limit)
+DEFAULT_OCR_PARALLEL_WORKERS = 2
+DEFAULT_OCR_PARALLEL_MIN_PAGES = 4
+DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 4
+DEFAULT_OCR_RETRY_ATTEMPTS = 3
+DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS = 2.0
+DEFAULT_OCR_TIMEOUT_SECONDS = 180.0
+DEFAULT_OCR_MAX_OUTPUT_TOKENS = 32768
+
 
 def _parse_int_env(name: str, default: int, *, minimum: int = 1) -> int:
     raw = os.getenv(name)
@@ -36,6 +58,17 @@ def _parse_int_env(name: str, default: int, *, minimum: int = 1) -> int:
         return default
     try:
         parsed = int(raw.strip())
+    except ValueError:
+        return default
+    return max(minimum, parsed)
+
+
+def _parse_float_env(name: str, default: float, *, minimum: float = 0.0) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        parsed = float(raw.strip())
     except ValueError:
         return default
     return max(minimum, parsed)
@@ -105,6 +138,31 @@ class Settings:
     max_recording_bytes: int = DEFAULT_MAX_RECORDING_BYTES
     worker_concurrency: int = DEFAULT_WORKER_CONCURRENCY
     allowed_recording_extensions: tuple[str, ...] = ALLOWED_RECORDING_EXTENSIONS
+    transcribe_target_bitrate: str = DEFAULT_TRANSCRIBE_TARGET_BITRATE
+    transcribe_max_upload_bytes: int = DEFAULT_TRANSCRIBE_MAX_UPLOAD_BYTES
+    transcribe_chunk_headroom_pct: int = DEFAULT_TRANSCRIBE_CHUNK_HEADROOM_PCT
+    transcribe_min_chunk_seconds: int = DEFAULT_TRANSCRIBE_MIN_CHUNK_SECONDS
+    transcribe_parallel_workers: int = DEFAULT_TRANSCRIBE_PARALLEL_WORKERS
+    transcribe_global_max_concurrent: int = DEFAULT_TRANSCRIBE_GLOBAL_MAX_CONCURRENT
+    transcribe_retry_attempts: int = DEFAULT_TRANSCRIBE_RETRY_ATTEMPTS
+    transcribe_retry_base_delay_seconds: float = DEFAULT_TRANSCRIBE_RETRY_BASE_DELAY_SECONDS
+    transcribe_timeout_seconds: float = DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS
+    ocr_max_pages_per_batch: int = DEFAULT_OCR_MAX_PAGES_PER_BATCH
+    ocr_max_batch_bytes: int = DEFAULT_OCR_MAX_BATCH_BYTES
+    ocr_parallel_workers: int = DEFAULT_OCR_PARALLEL_WORKERS
+    ocr_parallel_min_pages: int = DEFAULT_OCR_PARALLEL_MIN_PAGES
+    ocr_global_max_concurrent: int = DEFAULT_OCR_GLOBAL_MAX_CONCURRENT
+    ocr_retry_attempts: int = DEFAULT_OCR_RETRY_ATTEMPTS
+    ocr_retry_base_delay_seconds: float = DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS
+    ocr_timeout_seconds: float = DEFAULT_OCR_TIMEOUT_SECONDS
+    ocr_max_output_tokens: int = DEFAULT_OCR_MAX_OUTPUT_TOKENS
+    ffmpeg_path: str = ""
+    ffprobe_path: str = ""
+
+    @property
+    def transcribe_safe_upload_bytes(self) -> int:
+        headroom_pct = max(10, min(99, self.transcribe_chunk_headroom_pct))
+        return max(1, int(self.transcribe_max_upload_bytes * (headroom_pct / 100.0)))
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -153,4 +211,98 @@ def load_settings(
         worker_concurrency=_parse_int_env(
             "WORKER_CONCURRENCY", DEFAULT_WORKER_CONCURRENCY, minimum=1
         ),
+        transcribe_target_bitrate=os.getenv(
+            "TRANSCRIBE_TARGET_BITRATE", DEFAULT_TRANSCRIBE_TARGET_BITRATE
+        ).strip()
+        or DEFAULT_TRANSCRIBE_TARGET_BITRATE,
+        transcribe_max_upload_bytes=_parse_int_env(
+            "TRANSCRIBE_MAX_UPLOAD_BYTES",
+            DEFAULT_TRANSCRIBE_MAX_UPLOAD_BYTES,
+            minimum=1024,
+        ),
+        transcribe_chunk_headroom_pct=min(
+            99,
+            _parse_int_env(
+                "TRANSCRIBE_CHUNK_HEADROOM_PCT",
+                DEFAULT_TRANSCRIBE_CHUNK_HEADROOM_PCT,
+                minimum=10,
+            ),
+        ),
+        transcribe_min_chunk_seconds=_parse_int_env(
+            "TRANSCRIBE_MIN_CHUNK_SECONDS",
+            DEFAULT_TRANSCRIBE_MIN_CHUNK_SECONDS,
+            minimum=1,
+        ),
+        transcribe_parallel_workers=_parse_int_env(
+            "TRANSCRIBE_PARALLEL_WORKERS",
+            DEFAULT_TRANSCRIBE_PARALLEL_WORKERS,
+            minimum=1,
+        ),
+        transcribe_global_max_concurrent=_parse_int_env(
+            "TRANSCRIBE_GLOBAL_MAX_CONCURRENT",
+            DEFAULT_TRANSCRIBE_GLOBAL_MAX_CONCURRENT,
+            minimum=1,
+        ),
+        transcribe_retry_attempts=_parse_int_env(
+            "TRANSCRIBE_RETRY_ATTEMPTS",
+            DEFAULT_TRANSCRIBE_RETRY_ATTEMPTS,
+            minimum=1,
+        ),
+        transcribe_retry_base_delay_seconds=_parse_float_env(
+            "TRANSCRIBE_RETRY_BASE_DELAY_SECONDS",
+            DEFAULT_TRANSCRIBE_RETRY_BASE_DELAY_SECONDS,
+            minimum=0.0,
+        ),
+        transcribe_timeout_seconds=_parse_float_env(
+            "TRANSCRIBE_TIMEOUT_SECONDS",
+            DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS,
+            minimum=5.0,
+        ),
+        ocr_max_pages_per_batch=_parse_int_env(
+            "OCR_MAX_PAGES_PER_BATCH",
+            DEFAULT_OCR_MAX_PAGES_PER_BATCH,
+            minimum=1,
+        ),
+        ocr_max_batch_bytes=_parse_int_env(
+            "OCR_MAX_BATCH_BYTES",
+            DEFAULT_OCR_MAX_BATCH_BYTES,
+            minimum=1024,
+        ),
+        ocr_parallel_workers=_parse_int_env(
+            "OCR_PARALLEL_WORKERS",
+            DEFAULT_OCR_PARALLEL_WORKERS,
+            minimum=1,
+        ),
+        ocr_parallel_min_pages=_parse_int_env(
+            "OCR_PARALLEL_MIN_PAGES",
+            DEFAULT_OCR_PARALLEL_MIN_PAGES,
+            minimum=2,
+        ),
+        ocr_global_max_concurrent=_parse_int_env(
+            "OCR_GLOBAL_MAX_CONCURRENT",
+            DEFAULT_OCR_GLOBAL_MAX_CONCURRENT,
+            minimum=1,
+        ),
+        ocr_retry_attempts=_parse_int_env(
+            "OCR_RETRY_ATTEMPTS",
+            DEFAULT_OCR_RETRY_ATTEMPTS,
+            minimum=1,
+        ),
+        ocr_retry_base_delay_seconds=_parse_float_env(
+            "OCR_RETRY_BASE_DELAY_SECONDS",
+            DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS,
+            minimum=0.0,
+        ),
+        ocr_timeout_seconds=_parse_float_env(
+            "OCR_TIMEOUT_SECONDS",
+            DEFAULT_OCR_TIMEOUT_SECONDS,
+            minimum=5.0,
+        ),
+        ocr_max_output_tokens=_parse_int_env(
+            "OCR_MAX_OUTPUT_TOKENS",
+            DEFAULT_OCR_MAX_OUTPUT_TOKENS,
+            minimum=1024,
+        ),
+        ffmpeg_path=os.getenv("FFMPEG_PATH", "").strip(),
+        ffprobe_path=os.getenv("FFPROBE_PATH", "").strip(),
     )

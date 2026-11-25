@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
@@ -7,8 +8,10 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
+import pymupdf
 from fastapi.testclient import TestClient
 
 from backend.app.config import Settings, load_settings
@@ -20,7 +23,23 @@ from backend.app.db import (
     generate_job_token,
 )
 from backend.app.main import build_download_filename, create_app
-from backend.app.schemas import PIPELINE_STAGES, JobContext, StageError, StageResult
+from backend.app.pipeline import StageHandler
+from backend.app.pipeline.audio import FFmpegBinaries
+from backend.app.schemas import (
+    ARTIFACT_ALIGNMENT,
+    ARTIFACT_AUDIO_NORMALIZED,
+    ARTIFACT_NOTES_MD,
+    ARTIFACT_SLIDES_OCR,
+    ARTIFACT_TRANSCRIPT,
+    AlignmentArtifact,
+    PIPELINE_STAGES,
+    JobContext,
+    PipelineStage,
+    SlidesOCRArtifact,
+    StageError,
+    StageResult,
+    TranscriptArtifact,
+)
 
 
 def _make_settings(tmp_dir: Path, **overrides: object) -> Settings:
@@ -33,6 +52,66 @@ def _make_settings(tmp_dir: Path, **overrides: object) -> Settings:
     }
     kwargs.update(overrides)
     return Settings(**kwargs)  # type: ignore[arg-type]
+
+
+def _stub_audio_prep(context: JobContext, _settings: Settings) -> StageResult:
+    context.audio_normalized_path.write_bytes(b"stub-mp3")
+    return StageResult(
+        message="Audio prep stub completed.",
+        artifacts={"audio_normalized": "artifacts/audio_normalized.mp3"},
+    )
+
+
+def _stub_transcription(context: JobContext, settings: Settings) -> StageResult:
+    artifact = TranscriptArtifact(
+        source_recording=context.recording_filename,
+        model=settings.transcription_model,
+        duration_seconds=0.0,
+        segments=[],
+    )
+    context.transcript_path.write_text(artifact.model_dump_json(indent=2), encoding="utf-8")
+    return StageResult(
+        message="Transcription stub completed.",
+        artifacts={"transcript": ARTIFACT_TRANSCRIPT},
+        stats={"duration_seconds": 0.0, "transcript_segments": 0},
+    )
+
+
+def _stub_ocr(context: JobContext, settings: Settings) -> StageResult:
+    artifact = SlidesOCRArtifact(
+        source_pdf=context.slides_filename,
+        model=settings.ocr_model_google,
+        slide_count=0,
+        slides=[],
+    )
+    context.slides_ocr_path.write_text(artifact.model_dump_json(indent=2), encoding="utf-8")
+    return StageResult(
+        message="OCR stub completed.",
+        artifacts={"slides_ocr": ARTIFACT_SLIDES_OCR},
+        stats={"slide_count": 0},
+    )
+
+
+def _phase1_stub_handlers(**overrides: StageHandler) -> dict[PipelineStage, StageHandler]:
+    handlers: dict[PipelineStage, StageHandler] = {
+        "audio_prep": _stub_audio_prep,
+        "transcription": _stub_transcription,
+        "ocr": _stub_ocr,
+    }
+    for stage_name, handler in overrides.items():
+        handlers[stage_name] = handler  # type: ignore[index]
+    return handlers
+
+
+def _build_pdf_bytes(page_texts: list[str]) -> bytes:
+    doc = pymupdf.open()
+    try:
+        for text in page_texts:
+            page = doc.new_page(width=640, height=360)
+            page.insert_text((48, 72), text, fontsize=16)
+        return bytes(doc.tobytes())
+    finally:
+        doc.close()
 
 
 class Phase1BackendTests(unittest.TestCase):
@@ -154,7 +233,7 @@ class Phase1BackendTests(unittest.TestCase):
 
         app = create_app(
             settings=_make_settings(self.tmp_dir),
-            stage_handlers={"audio_prep": gated_audio_prep},
+            stage_handlers=_phase1_stub_handlers(audio_prep=gated_audio_prep),
         )
 
         with TestClient(app) as client:
@@ -218,7 +297,7 @@ class Phase1BackendTests(unittest.TestCase):
 
         app = create_app(
             settings=_make_settings(self.tmp_dir),
-            stage_handlers={"ocr": failing_ocr},
+            stage_handlers=_phase1_stub_handlers(ocr=failing_ocr),
         )
         with TestClient(app) as client:
             create_resp = client.post(
@@ -266,7 +345,7 @@ class Phase1BackendTests(unittest.TestCase):
 
         app = create_app(
             settings=_make_settings(self.tmp_dir),
-            stage_handlers={"alignment": crashing_alignment},
+            stage_handlers=_phase1_stub_handlers(alignment=crashing_alignment),
         )
         with TestClient(app) as client:
             create_resp = client.post(
@@ -353,23 +432,30 @@ class Phase1BackendTests(unittest.TestCase):
         progress_written = threading.Event()
         release_stage = threading.Event()
 
-        def chunked_transcription(context: JobContext, _settings: Settings) -> StageResult:
+        def chunked_transcription(context: JobContext, settings: Settings) -> StageResult:
             context.report_progress("Transcribing chunk 2 of 4...")
             progress_written.set()
             release_stage.wait(timeout=5.0)
-            context.transcript_path.write_text('{"segments": []}', encoding="utf-8")
+            artifact = TranscriptArtifact(
+                source_recording=context.recording_filename,
+                model=settings.transcription_model,
+                duration_seconds=3612.5,
+                segments=[],
+            )
+            context.transcript_path.write_text(artifact.model_dump_json(indent=2), encoding="utf-8")
             return StageResult(
                 message="Transcribed 4 chunks.",
-                artifacts={"transcript": "artifacts/transcript.json"},
+                artifacts={"transcript": ARTIFACT_TRANSCRIPT},
                 stats={"duration_seconds": 3612.5, "transcript_segments": 420},
                 warnings=["Chunk 3 retried once after rate limit."],
             )
 
-        def alignment_with_warning(context: JobContext, _settings: Settings) -> StageResult:
-            context.alignment_path.write_text('{"entries": []}', encoding="utf-8")
+        def alignment_with_warning(context: JobContext, settings: Settings) -> StageResult:
+            artifact = AlignmentArtifact(mode=settings.pipeline_llm_mode, entries=[], alignment_issues=[])
+            context.alignment_path.write_text(artifact.model_dump_json(indent=2), encoding="utf-8")
             return StageResult(
                 message="Aligned with 1 warning.",
-                artifacts={"alignment": "artifacts/alignment.json"},
+                artifacts={"alignment": ARTIFACT_ALIGNMENT},
                 warnings=[
                     "Chunk 3 retried once after rate limit.",  # duplicate should be deduplicated
                     "Slide 12 alignment uncertain; falling back to timestamps.",
@@ -378,10 +464,10 @@ class Phase1BackendTests(unittest.TestCase):
 
         app = create_app(
             settings=_make_settings(self.tmp_dir),
-            stage_handlers={
-                "transcription": chunked_transcription,
-                "alignment": alignment_with_warning,
-            },
+            stage_handlers=_phase1_stub_handlers(
+                transcription=chunked_transcription,
+                alignment=alignment_with_warning,
+            ),
         )
 
         with TestClient(app) as client:
@@ -432,7 +518,10 @@ class Phase1BackendTests(unittest.TestCase):
             self.assertFalse(preview["truncated"])
 
     def test_pdf_header_allowed_within_first_1024_bytes(self) -> None:
-        app = create_app(settings=_make_settings(self.tmp_dir))
+        app = create_app(
+            settings=_make_settings(self.tmp_dir),
+            stage_handlers=_phase1_stub_handlers(),
+        )
         with TestClient(app) as client:
             # Valid PDF with leading preamble bytes (< 1024 bytes before %PDF-)
             ok_resp = client.post(
@@ -520,6 +609,15 @@ class Phase1BackendTests(unittest.TestCase):
             "GOOGLE_GENAI_USE_VERTEXAI": "true",
             "GOOGLE_CLOUD_PROJECT": "my-gcp-project",
             "GOOGLE_CLOUD_LOCATION": "europe-west4",
+            "OCR_MAX_PAGES_PER_BATCH": "12",
+            "OCR_MAX_BATCH_BYTES": "10485760",
+            "OCR_PARALLEL_WORKERS": "3",
+            "OCR_PARALLEL_MIN_PAGES": "6",
+            "OCR_GLOBAL_MAX_CONCURRENT": "5",
+            "OCR_RETRY_ATTEMPTS": "4",
+            "OCR_RETRY_BASE_DELAY_SECONDS": "1.5",
+            "OCR_TIMEOUT_SECONDS": "120",
+            "OCR_MAX_OUTPUT_TOKENS": "16384",
         }
         with mock.patch.dict(os.environ, env_patch, clear=False):
             cfg = load_settings(env_file=self.tmp_dir / "nonexistent.env")
@@ -527,10 +625,247 @@ class Phase1BackendTests(unittest.TestCase):
         self.assertTrue(cfg.google_genai_use_vertexai)
         self.assertEqual(cfg.google_cloud_project, "my-gcp-project")
         self.assertEqual(cfg.google_cloud_location, "europe-west4")
+        self.assertEqual(cfg.ocr_max_pages_per_batch, 12)
+        self.assertEqual(cfg.ocr_max_batch_bytes, 10_485_760)
+        self.assertEqual(cfg.ocr_parallel_workers, 3)
+        self.assertEqual(cfg.ocr_parallel_min_pages, 6)
+        self.assertEqual(cfg.ocr_global_max_concurrent, 5)
+        self.assertEqual(cfg.ocr_retry_attempts, 4)
+        self.assertEqual(cfg.ocr_retry_base_delay_seconds, 1.5)
+        self.assertEqual(cfg.ocr_timeout_seconds, 120.0)
+        self.assertEqual(cfg.ocr_max_output_tokens, 16384)
         self.assertIn("http://localhost:5173", cfg.frontend_origins)
         self.assertIn("http://127.0.0.1:5173", cfg.frontend_origins)
         self.assertIn("http://localhost:4173", cfg.frontend_origins)
         self.assertIn("http://127.0.0.1:4173", cfg.frontend_origins)
+
+    def test_full_pipeline_end_to_end_via_api_in_stub_mode(self) -> None:
+        settings = _make_settings(
+            self.tmp_dir,
+            groq_api_key="gsk-test-e2e",
+            gemini_api_key="AIza-test-e2e",
+            pipeline_llm_mode="stub",
+        )
+        pdf_bytes = _build_pdf_bytes(
+            [
+                "Lecture 4: Hash Tables",
+                "Collision Resolution: Chaining vs Open Addressing",
+            ]
+        )
+
+        def fake_normalize(_src, output_path: Path, **_kwargs) -> Path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"ID3-normalized-audio")
+            return output_path
+
+        fake_groq_client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(
+                    create=lambda **_kwargs: SimpleNamespace(
+                        segments=[
+                            SimpleNamespace(
+                                start=0.0,
+                                end=18.5,
+                                text="Welcome to Lecture 4 on hash tables and constant-time lookup.",
+                            ),
+                            SimpleNamespace(
+                                start=18.5,
+                                end=42.0,
+                                text="When two keys collide, chaining stores a bucket list while open addressing probes.",
+                            ),
+                        ]
+                    )
+                )
+            )
+        )
+        fake_gemini_client = SimpleNamespace(
+            models=SimpleNamespace(
+                generate_content=lambda **_kwargs: SimpleNamespace(
+                    text=json.dumps(
+                        [
+                            {
+                                "slide": 1,
+                                "text": (
+                                    "VISIBLE_TEXT:\nLecture 4: Hash Tables\nO(1) average lookup\n\n"
+                                    "VISUAL_CONTEXT:\n- Diagram mapping keys through h(k) into bucket array."
+                                ),
+                            },
+                            {
+                                "slide": 2,
+                                "text": (
+                                    "VISIBLE_TEXT:\nCollision Resolution\nChaining vs Open Addressing\n\n"
+                                    "TABLES_CODE_FORMULAS:\nload_factor = n / m"
+                                ),
+                            },
+                        ]
+                    ),
+                    usage_metadata=SimpleNamespace(
+                        prompt_token_count=320,
+                        candidates_token_count=110,
+                    ),
+                )
+            )
+        )
+
+        # No stage_handlers override: exercises the full default wired pipeline end-to-end.
+        app = create_app(settings=settings)
+        with (
+            mock.patch(
+                "backend.app.pipeline.audio.resolve_ffmpeg_binaries",
+                return_value=FFmpegBinaries(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+            ),
+            mock.patch(
+                "backend.app.pipeline.audio.normalize_audio_to_mp3",
+                side_effect=fake_normalize,
+            ),
+            mock.patch(
+                "backend.app.pipeline.audio.probe_audio_duration",
+                return_value=42.0,
+            ),
+            mock.patch(
+                "backend.app.pipeline.transcribe._default_groq_client_factory",
+                return_value=fake_groq_client,
+            ),
+            mock.patch(
+                "backend.app.pipeline.transcribe._try_probe_duration_best_effort",
+                return_value=42.0,
+            ),
+            mock.patch(
+                "backend.app.pipeline.ocr._default_genai_client_factory",
+                return_value=fake_gemini_client,
+            ),
+        ):
+            with TestClient(app) as client:
+                create_resp = client.post(
+                    "/api/jobs",
+                    files={
+                        "slides": ("Week 04 Hash Tables.pdf", pdf_bytes, "application/pdf"),
+                        "recording": ("lecture.mp4", b"fake-mp4-video", "video/mp4"),
+                    },
+                )
+                self.assertEqual(create_resp.status_code, 202)
+                token = create_resp.json()["token"]
+                app.state.worker.wait_for_job(token, timeout=10.0)
+
+                status_resp = client.get(f"/api/jobs/{token}")
+                self.assertEqual(status_resp.status_code, 200)
+                status_data = status_resp.json()
+                self.assertEqual(status_data["status"], "completed")
+                self.assertEqual(status_data["progress_pct"], 100)
+                self.assertTrue(status_data["download_ready"])
+                self.assertIsNone(status_data["error"])
+                self.assertTrue(all(s["status"] == "completed" for s in status_data["stages"]))
+
+                self.assertEqual(status_data["artifacts"]["audio_normalized"], ARTIFACT_AUDIO_NORMALIZED)
+                self.assertEqual(status_data["artifacts"]["transcript"], ARTIFACT_TRANSCRIPT)
+                self.assertEqual(status_data["artifacts"]["slides_ocr"], ARTIFACT_SLIDES_OCR)
+                self.assertEqual(status_data["artifacts"]["alignment"], ARTIFACT_ALIGNMENT)
+                self.assertEqual(status_data["artifacts"]["notes_md"], ARTIFACT_NOTES_MD)
+
+                self.assertEqual(status_data["stats"]["slide_count"], 2)
+                self.assertEqual(status_data["stats"]["transcript_segments"], 2)
+                self.assertEqual(status_data["stats"]["duration_seconds"], 42.0)
+                self.assertGreaterEqual(status_data["stats"]["section_count"], 1)
+                self.assertGreater(status_data["stats"]["word_count"], 20)
+
+                dl_resp = client.get(f"/api/jobs/{token}/download")
+                self.assertEqual(dl_resp.status_code, 200)
+                self.assertIn("Hash Tables", dl_resp.text)
+                self.assertIn("Diagram mapping keys through h(k)", dl_resp.text)
+                self.assertIn("load_factor = n / m", dl_resp.text)
+                self.assertIn("open addressing probes", dl_resp.text)
+
+                preview_resp = client.get(f"/api/jobs/{token}/preview")
+                self.assertEqual(preview_resp.status_code, 200)
+                preview_data = preview_resp.json()
+                self.assertEqual(preview_data["filename"], "week-04-hash-tables-notes.md")
+                self.assertEqual(
+                    preview_data["content"],
+                    dl_resp.text.replace("\r\n", "\n"),
+                )
+
+    def test_strict_ocr_failure_via_api_when_gemini_credentials_missing(self) -> None:
+        settings = _make_settings(
+            self.tmp_dir,
+            groq_api_key="gsk-test-strict-ocr",
+            gemini_api_key="",
+            google_genai_use_vertexai=False,
+        )
+        pdf_bytes = _build_pdf_bytes(["Slide text that must never leak via pdfplumber fallback"])
+
+        def fake_normalize(_src, output_path: Path, **_kwargs) -> Path:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"ID3-normalized-audio")
+            return output_path
+
+        fake_groq_client = SimpleNamespace(
+            audio=SimpleNamespace(
+                transcriptions=SimpleNamespace(
+                    create=lambda **_kwargs: SimpleNamespace(
+                        segments=[SimpleNamespace(start=0.0, end=3.0, text="Hello class.")]
+                    )
+                )
+            )
+        )
+
+        # Default wired handlers: audio_prep & transcription succeed, then strict OCR fails.
+        app = create_app(settings=settings)
+        with (
+            mock.patch(
+                "backend.app.pipeline.audio.resolve_ffmpeg_binaries",
+                return_value=FFmpegBinaries(ffmpeg="ffmpeg", ffprobe="ffprobe"),
+            ),
+            mock.patch(
+                "backend.app.pipeline.audio.normalize_audio_to_mp3",
+                side_effect=fake_normalize,
+            ),
+            mock.patch(
+                "backend.app.pipeline.audio.probe_audio_duration",
+                return_value=3.0,
+            ),
+            mock.patch(
+                "backend.app.pipeline.transcribe._default_groq_client_factory",
+                return_value=fake_groq_client,
+            ),
+            mock.patch(
+                "backend.app.pipeline.transcribe._try_probe_duration_best_effort",
+                return_value=3.0,
+            ),
+        ):
+            with TestClient(app) as client:
+                create_resp = client.post(
+                    "/api/jobs",
+                    files={
+                        "slides": ("strict.pdf", pdf_bytes, "application/pdf"),
+                        "recording": ("lecture.mp3", b"ID3-bytes", "audio/mpeg"),
+                    },
+                )
+                self.assertEqual(create_resp.status_code, 202)
+                token = create_resp.json()["token"]
+                app.state.worker.wait_for_job(token, timeout=10.0)
+
+                status_resp = client.get(f"/api/jobs/{token}")
+                self.assertEqual(status_resp.status_code, 200)
+                data = status_resp.json()
+                self.assertEqual(data["status"], "failed")
+                self.assertEqual(data["current_stage"], "ocr")
+                self.assertFalse(data["download_ready"])
+                self.assertEqual(data["error"]["stage"], "ocr")
+                self.assertEqual(data["error"]["stage_label"], "Slide OCR (Gemini)")
+                self.assertIn("GEMINI_API_KEY", data["error"]["message"])
+                self.assertIn("GEMINI_API_KEY", data["error"]["hint"])
+
+                stages_by_name = {s["stage"]: s["status"] for s in data["stages"]}
+                self.assertEqual(stages_by_name["audio_prep"], "completed")
+                self.assertEqual(stages_by_name["transcription"], "completed")
+                self.assertEqual(stages_by_name["ocr"], "failed")
+                self.assertEqual(stages_by_name["alignment"], "pending")
+                self.assertEqual(stages_by_name["notes"], "pending")
+
+                # Confirm zero fallback artifact was created on disk.
+                slides_ocr_file = settings.jobs_dir / token / ARTIFACT_SLIDES_OCR
+                self.assertFalse(slides_ocr_file.exists())
+                self.assertEqual(client.get(f"/api/jobs/{token}/download").status_code, 409)
 
 
 if __name__ == "__main__":
