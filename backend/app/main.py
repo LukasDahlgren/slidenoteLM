@@ -3,14 +3,24 @@ from __future__ import annotations
 import re
 import shutil
 from contextlib import asynccontextmanager
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import AsyncIterator
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from .config import Settings, load_settings
+from .auth import (
+    AuthLoginRequest,
+    AuthStatusResponse,
+    clear_session_cookie,
+    create_session_token,
+    is_request_authenticated,
+    set_session_cookie,
+    verify_password,
+)
+from .config import REPO_ROOT, Settings, load_settings
 from .db import JobStore, generate_job_token
 from .pipeline import StageHandler
 from .schemas import (
@@ -222,12 +232,61 @@ def _require_completed_notes_path(store: JobStore, token: str) -> tuple[dict, Pa
     return job, notes_path
 
 
+class AppPasswordMiddleware:
+    """Enforce optional APP_PASSWORD cookie authentication on /api/jobs* routes."""
+
+    def __init__(self, app: ASGIApp, settings: Settings) -> None:
+        self.app = app
+        self.settings = settings
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and self.settings.app_password:
+            path = scope.get("path", "")
+            method = scope.get("method", "GET").upper()
+            if method != "OPTIONS" and (path == "/api/jobs" or path.startswith("/api/jobs/")):
+                request = Request(scope, receive=receive)
+                if not is_request_authenticated(request, self.settings):
+                    response = JSONResponse(
+                        status_code=status.HTTP_401_UNAUTHORIZED,
+                        content={"detail": "Authentication required."},
+                    )
+                    await response(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
+def _has_unsafe_path_syntax(raw_path: str) -> bool:
+    if "\x00" in raw_path or "\\" in raw_path:
+        return True
+    return ".." in PurePosixPath(raw_path).parts
+
+
+def _resolve_static_file(dist_dir: Path, raw_path: str) -> Path | None:
+    normalized = raw_path.lstrip("/")
+    if not normalized or _has_unsafe_path_syntax(normalized):
+        return None
+    candidate = (dist_dir / normalized).resolve()
+    try:
+        candidate.relative_to(dist_dir)
+    except ValueError:
+        return None
+    if candidate.is_file():
+        return candidate
+    return None
+
+
 def create_app(
     *,
     settings: Settings | None = None,
     stage_handlers: dict[PipelineStage, StageHandler] | None = None,
+    frontend_dist_dir: Path | None = None,
 ) -> FastAPI:
     resolved_settings = settings or load_settings()
+    resolved_dist_dir = (
+        frontend_dist_dir
+        if frontend_dist_dir is not None
+        else (REPO_ROOT / "frontend" / "dist")
+    ).resolve()
     store = JobStore(resolved_settings.db_path)
     worker = JobWorker(store, resolved_settings, stage_handlers=stage_handlers)
 
@@ -249,7 +308,9 @@ def create_app(
     application.state.settings = resolved_settings
     application.state.store = store
     application.state.worker = worker
+    application.state.frontend_dist_dir = resolved_dist_dir
 
+    application.add_middleware(AppPasswordMiddleware, settings=resolved_settings)
     application.add_middleware(
         CORSMiddleware,
         allow_origins=list(resolved_settings.frontend_origins),
@@ -261,6 +322,48 @@ def create_app(
     @application.get("/api/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         return HealthResponse(pipeline_llm_mode=resolved_settings.pipeline_llm_mode)
+
+    @application.get("/api/auth/status", response_model=AuthStatusResponse)
+    def auth_status(request: Request) -> AuthStatusResponse:
+        auth_required = bool(resolved_settings.app_password)
+        authenticated = (
+            True
+            if not auth_required
+            else is_request_authenticated(request, resolved_settings)
+        )
+        return AuthStatusResponse(
+            auth_required=auth_required,
+            authenticated=authenticated,
+        )
+
+    @application.post("/api/auth/login", response_model=AuthStatusResponse)
+    def auth_login(
+        payload: AuthLoginRequest,
+        request: Request,
+        response: Response,
+    ) -> AuthStatusResponse:
+        if not resolved_settings.app_password:
+            return AuthStatusResponse(auth_required=False, authenticated=True)
+        if not verify_password(payload.password, resolved_settings.app_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid password.",
+            )
+        token = create_session_token(
+            resolved_settings.app_password,
+            resolved_settings.app_session_secret,
+        )
+        set_session_cookie(response, request, token)
+        return AuthStatusResponse(auth_required=True, authenticated=True)
+
+    @application.post("/api/auth/logout", response_model=AuthStatusResponse)
+    def auth_logout(request: Request, response: Response) -> AuthStatusResponse:
+        clear_session_cookie(response, request)
+        auth_required = bool(resolved_settings.app_password)
+        return AuthStatusResponse(
+            auth_required=auth_required,
+            authenticated=not auth_required,
+        )
 
     @application.post(
         "/api/jobs",
@@ -378,6 +481,52 @@ def create_app(
             media_type="text/markdown; charset=utf-8",
             filename=build_download_filename(str(job["slides_filename"])),
         )
+
+    index_html = resolved_dist_dir / "index.html"
+    if index_html.is_file():
+
+        @application.get("/{full_path:path}", include_in_schema=False)
+        def serve_spa(full_path: str) -> FileResponse:
+            normalized = full_path.lstrip("/")
+            if normalized == "api" or normalized.startswith("api/"):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Not Found",
+                )
+
+            if _has_unsafe_path_syntax(normalized):
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Not Found",
+                )
+
+            if normalized:
+                raw_candidate = resolved_dist_dir / normalized
+                resolved_candidate = raw_candidate.resolve()
+                try:
+                    resolved_candidate.relative_to(resolved_dist_dir)
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Not Found",
+                    ) from exc
+
+                static_file = _resolve_static_file(resolved_dist_dir, normalized)
+                if static_file is not None:
+                    headers = (
+                        {"Cache-Control": "no-cache"}
+                        if static_file == index_html
+                        else None
+                    )
+                    return FileResponse(path=static_file, headers=headers)
+
+                if normalized == "assets" or normalized.startswith("assets/"):
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail="Not Found",
+                    )
+
+            return FileResponse(path=index_html, headers={"Cache-Control": "no-cache"})
 
     return application
 

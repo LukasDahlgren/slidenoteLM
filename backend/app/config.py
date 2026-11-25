@@ -158,6 +158,8 @@ class Settings:
     ocr_max_output_tokens: int = DEFAULT_OCR_MAX_OUTPUT_TOKENS
     ffmpeg_path: str = ""
     ffprobe_path: str = ""
+    app_password: str = ""
+    app_session_secret: str = ""
 
     @property
     def transcribe_safe_upload_bytes(self) -> int:
@@ -305,4 +307,6 @@ def load_settings(
         ),
         ffmpeg_path=os.getenv("FFMPEG_PATH", "").strip(),
         ffprobe_path=os.getenv("FFPROBE_PATH", "").strip(),
+        app_password=os.getenv("APP_PASSWORD", "").strip(),
+        app_session_secret=os.getenv("APP_SESSION_SECRET", "").strip(),
     )
