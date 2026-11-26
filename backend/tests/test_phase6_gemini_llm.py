@@ -204,7 +204,7 @@ class TestPhase6GeminiConfigAndThinking(unittest.TestCase):
 
         self.assertEqual(cfg.pipeline_llm_mode, "gemini")
         self.assertEqual(cfg.ocr_model_google, "gemini-4-neon")
-        self.assertEqual(cfg.ocr_thinking_level, "LOW")
+        self.assertEqual(cfg.ocr_thinking_level, "MEDIUM")
         self.assertEqual(cfg.llm_align_model, "gemini-4-neon")
         self.assertEqual(cfg.llm_align_thinking_level, "HIGH")
         self.assertEqual(cfg.llm_notes_model, "gemini-4-neon")
@@ -503,7 +503,7 @@ class TestPhase6GeminiErrorsSafetyAndLifecycle(unittest.TestCase):
 
 
 class TestPhase6GeminiOCRThinking(unittest.TestCase):
-    def test_ocr_passes_gemini_4_neon_and_low_thinking_without_forcing_zero_temp(self) -> None:
+    def test_ocr_passes_gemini_4_neon_and_medium_thinking_without_forcing_zero_temp(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_dir = Path(tmp)
             pdf_path = tmp_dir / "slides.pdf"
@@ -518,7 +518,7 @@ class TestPhase6GeminiOCRThinking(unittest.TestCase):
             settings = _make_settings(
                 tmp_dir,
                 ocr_model_google="gemini-4-neon",
-                ocr_thinking_level="LOW",
+                ocr_thinking_level="MEDIUM",
             )
             fake_client = _FakeTextClient(
                 [json.dumps([{"slide": 1, "text": "VISIBLE_TEXT:\nTransformers"}])]
@@ -537,7 +537,7 @@ class TestPhase6GeminiOCRThinking(unittest.TestCase):
         self.assertEqual(call["model"], "gemini-4-neon")
         cfg = call["config"]
         self.assertIsNotNone(cfg.thinking_config)
-        self.assertEqual(cfg.thinking_config.thinking_level, types.ThinkingLevel.LOW)
+        self.assertEqual(cfg.thinking_config.thinking_level, types.ThinkingLevel.MEDIUM)
         self.assertIsNone(cfg.temperature)
 
 

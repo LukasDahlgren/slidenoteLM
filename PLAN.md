@@ -137,7 +137,7 @@ slidenoteLM/
 
 ### Phase 6 — Wire Chosen LLM Provider & Live Content Verification
 **Goal:** Plug Google Gemini 4 Neon (`gemini-4-neon`, varied `thinking_level` per stage) cleanly into the Phase 4 hooks via `google-genai` (keeping the app at 2 providers total: Groq Whisper + Google Gemini) and verify note fidelity on a real lecture.
-- [x] Bump `google-genai>=2.34.0` in `backend/requirements.txt` and add per-stage Gemini 4 Neon model & `thinking_level` env vars (`LOW` for OCR, `HIGH` for Alignment & Notes, `MEDIUM` for Coverage Audit) to `.env.example` and `backend/app/config.py`.
+- [x] Bump `google-genai>=2.34.0` in `backend/requirements.txt` and add per-stage Gemini 4 Neon model & `thinking_level` env vars (`MEDIUM` for OCR, `HIGH` for Alignment & Notes, `MEDIUM` for Coverage Audit) to `.env.example` and `backend/app/config.py`.
 - [x] Implement the single-provider Gemini 4 calls inside `backend/app/pipeline/gemini_client.py`, `backend/app/pipeline/ocr.py`, `backend/app/pipeline/align.py`, and `backend/app/pipeline/notes.py` (no multi-provider wrapper bloat), with unit tests in `backend/tests/test_phase6_gemini_llm.py`.
 - [ ] Run end-to-end on a real lecture (PDF + recording).
 - [ ] **Speech-only content check:**

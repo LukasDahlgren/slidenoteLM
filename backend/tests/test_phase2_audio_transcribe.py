@@ -208,12 +208,17 @@ class Phase2AudioUnitTests(unittest.TestCase):
         target = self.tmp_dir / "artifacts" / "audio_normalized.mp3"
         recorded_cmds: list[list[str]] = []
 
-        def fake_run(cmd, **_kwargs):
+        def fake_launch(cmd, **kwargs):
             recorded_cmds.append(list(cmd))
+            self.assertIs(kwargs["stdin"], subprocess.DEVNULL)
             Path(cmd[-1]).write_bytes(b"ID3-normalized-mp3-bytes")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            process = mock.MagicMock()
+            process.__enter__.return_value = process
+            process.communicate.return_value = (None, b"")
+            process.returncode = 0
+            return process
 
-        with mock.patch("backend.app.pipeline.audio.subprocess.run", side_effect=fake_run):
+        with mock.patch("backend.app.pipeline.audio.subprocess.Popen", side_effect=fake_launch):
             out = normalize_audio_to_mp3(
                 source,
                 target,
@@ -229,6 +234,7 @@ class Phase2AudioUnitTests(unittest.TestCase):
 
         cmd = recorded_cmds[0]
         self.assertEqual(cmd[0], "/usr/bin/ffmpeg")
+        self.assertIn("-nostdin", cmd)
         self.assertIn("-vn", cmd)
         self.assertIn("0:a:0", cmd)
         self.assertEqual(cmd[cmd.index("-ac") + 1], str(TARGET_CHANNELS))
@@ -245,12 +251,28 @@ class Phase2AudioUnitTests(unittest.TestCase):
             cmd=["ffmpeg"],
             stderr="Stream map '0:a:0' matches no streams.\n",
         )
-        with mock.patch("backend.app.pipeline.audio.subprocess.run", side_effect=err):
+        with mock.patch("backend.app.pipeline.audio._run_ffmpeg", side_effect=err):
             with self.assertRaises(StageError) as ctx:
                 normalize_audio_to_mp3(source, target)
 
         self.assertEqual(ctx.exception.stage, "audio_prep")
         self.assertIn("does not contain an audio track", ctx.exception.message)
+        self.assertFalse(target.exists())
+
+    def test_stalled_encoder_is_stopped_and_partial_output_removed(self) -> None:
+        source = self.tmp_dir / "recording.mp3"
+        source.touch()
+        target = self.tmp_dir / "output.mp3"
+        partial = self.tmp_dir / ".output.tmp.mp3"
+        partial.write_bytes(b"partial audio")
+        with mock.patch("backend.app.pipeline.audio.subprocess.Popen") as popen:
+            proc = popen.return_value.__enter__.return_value
+            timeout = subprocess.TimeoutExpired("ffmpeg", 180)
+            proc.communicate.side_effect = [timeout, timeout, (None, b"")]
+            with self.assertRaisesRegex(StageError, "wrote no audio"):
+                normalize_audio_to_mp3(source, target)
+            proc.kill.assert_called_once()
+        self.assertFalse(partial.exists())
         self.assertFalse(target.exists())
 
     def test_probe_audio_duration_falls_back_to_stream_duration_when_format_is_na(self) -> None:

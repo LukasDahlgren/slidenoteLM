@@ -223,17 +223,30 @@ class Phase1BackendTests(unittest.TestCase):
 
     def test_upload_runs_background_stages_and_serves_markdown_download(self) -> None:
         gate = threading.Event()
-        stage_started = threading.Event()
+        ocr_started = threading.Event()
+        transcript_written = threading.Event()
 
         def gated_audio_prep(context: JobContext, _settings: Settings) -> StageResult:
-            stage_started.set()
-            gate.wait(timeout=5.0)
+            self.assertTrue(gate.wait(timeout=5.0))
             self.assertTrue(context.recording_path.is_file())
-            return StageResult(message="Audio normalized.")
+            return _stub_audio_prep(context, _settings)
+
+        def transcription(context: JobContext, settings: Settings) -> StageResult:
+            self.assertEqual(context.artifacts["audio_normalized"], ARTIFACT_AUDIO_NORMALIZED)
+            result = _stub_transcription(context, settings)
+            transcript_written.set()
+            return result
+
+        def gated_ocr(context: JobContext, settings: Settings) -> StageResult:
+            ocr_started.set()
+            self.assertTrue(transcript_written.wait(timeout=5.0))
+            return _stub_ocr(context, settings)
 
         app = create_app(
             settings=_make_settings(self.tmp_dir),
-            stage_handlers=_phase1_stub_handlers(audio_prep=gated_audio_prep),
+            stage_handlers=_phase1_stub_handlers(
+                audio_prep=gated_audio_prep, transcription=transcription, ocr=gated_ocr,
+            ),
         )
 
         with TestClient(app) as client:
@@ -250,13 +263,14 @@ class Phase1BackendTests(unittest.TestCase):
             self.assertGreaterEqual(len(token), 32)
             self.assertEqual(created["result_url"], f"/jobs/{token}")
 
-            # Wait until worker enters audio_prep so we can inspect in-progress state
-            self.assertTrue(stage_started.wait(timeout=5.0))
+            self.assertTrue(ocr_started.wait(timeout=5.0))
             in_progress = client.get(f"/api/jobs/{token}")
             self.assertEqual(in_progress.status_code, 200)
             in_progress_data = in_progress.json()
             self.assertEqual(in_progress_data["status"], "processing")
             self.assertEqual(in_progress_data["current_stage"], "audio_prep")
+            running = {s["stage"] for s in in_progress_data["stages"] if s["status"] == "running"}
+            self.assertEqual(running, {"ocr", "audio_prep"})
             self.assertFalse(in_progress_data["download_ready"])
             self.assertIsNone(in_progress_data["download_url"])
 
@@ -288,6 +302,12 @@ class Phase1BackendTests(unittest.TestCase):
             self.assertIn("# Week 02 Intro", dl_resp.text)
 
     def test_stage_error_reports_exact_stage_and_actionable_hint(self) -> None:
+        failure_saved = threading.Event()
+
+        def gated_audio_prep(context: JobContext, settings: Settings) -> StageResult:
+            self.assertTrue(failure_saved.wait(timeout=5.0))
+            return _stub_audio_prep(context, settings)
+
         def failing_ocr(_context: JobContext, _settings: Settings) -> StageResult:
             raise StageError(
                 stage="ocr",
@@ -297,9 +317,15 @@ class Phase1BackendTests(unittest.TestCase):
 
         app = create_app(
             settings=_make_settings(self.tmp_dir),
-            stage_handlers=_phase1_stub_handlers(ocr=failing_ocr),
+            stage_handlers=_phase1_stub_handlers(audio_prep=gated_audio_prep, ocr=failing_ocr),
         )
-        with TestClient(app) as client:
+        mark_failed = app.state.store.mark_job_failed
+
+        def record_failure(*args, **kwargs):
+            mark_failed(*args, **kwargs)
+            failure_saved.set()
+
+        with mock.patch.object(app.state.store, "mark_job_failed", record_failure), TestClient(app) as client:
             create_resp = client.post(
                 "/api/jobs",
                 files={
@@ -330,7 +356,7 @@ class Phase1BackendTests(unittest.TestCase):
             stages_by_name = {s["stage"]: s for s in data["stages"]}
             self.assertEqual(stages_by_name["upload"]["status"], "completed")
             self.assertEqual(stages_by_name["audio_prep"]["status"], "completed")
-            self.assertEqual(stages_by_name["transcription"]["status"], "completed")
+            self.assertEqual(stages_by_name["transcription"]["status"], "pending")
             self.assertEqual(stages_by_name["ocr"]["status"], "failed")
             self.assertEqual(stages_by_name["alignment"]["status"], "pending")
             self.assertEqual(stages_by_name["notes"]["status"], "pending")
@@ -396,8 +422,9 @@ class Phase1BackendTests(unittest.TestCase):
         store.mark_job_started("interrupted-token")
         store.complete_stage("interrupted-token", "audio_prep", message="Done")
         store.start_stage("interrupted-token", "transcription", message="Transcribing...")
+        store.start_stage("interrupted-token", "ocr", message="Reading slides...")
 
-        # Also simulate a queued job that hadn't started any background stage yet
+        # This queued job already has a saved OCR checkpoint.
         queued_dir = settings.jobs_dir / "queued-token"
         (queued_dir / "input").mkdir(parents=True, exist_ok=True)
         store.create_job(
@@ -407,9 +434,15 @@ class Phase1BackendTests(unittest.TestCase):
             artifacts={"slides_pdf": "input/slides.pdf", "recording": "input/recording.mp3"},
             token="queued-token",
         )
+        (queued_dir / "artifacts").mkdir()
+        (queued_dir / ARTIFACT_SLIDES_OCR).write_text(
+            SlidesOCRArtifact(source_pdf="slides2.pdf").model_dump_json(), encoding="utf-8",
+        )
+        store.complete_stage("queued-token", "ocr", artifacts={"slides_ocr": ARTIFACT_SLIDES_OCR})
+        unexpected_ocr = mock.Mock(side_effect=AssertionError("Completed OCR ran twice"))
 
         # Booting a fresh FastAPI app runs lifespan recovery
-        app = create_app(settings=settings)
+        app = create_app(settings=settings, stage_handlers=_phase1_stub_handlers(ocr=unexpected_ocr))
         with TestClient(app) as client:
             resp = client.get("/api/jobs/interrupted-token")
             self.assertEqual(resp.status_code, 200)
@@ -419,14 +452,15 @@ class Phase1BackendTests(unittest.TestCase):
             self.assertEqual(data["error"]["stage"], "transcription")
             self.assertEqual(data["error"]["message"], INTERRUPTED_MESSAGE)
             self.assertEqual(data["error"]["hint"], INTERRUPTED_HINT)
+            failed = {s["stage"] for s in data["stages"] if s["status"] == "failed"}
+            self.assertEqual(failed, {"transcription", "ocr"})
 
+            app.state.worker.wait_for_job("queued-token", timeout=5.0)
             queued_resp = client.get("/api/jobs/queued-token")
             self.assertEqual(queued_resp.status_code, 200)
             queued_data = queued_resp.json()
-            self.assertEqual(queued_data["status"], "failed")
-            self.assertEqual(queued_data["current_stage"], "audio_prep")
-            self.assertEqual(queued_data["error"]["stage"], "audio_prep")
-            self.assertEqual(queued_data["error"]["message"], INTERRUPTED_MESSAGE)
+            self.assertEqual(queued_data["status"], "completed", queued_data["error"])
+            unexpected_ocr.assert_not_called()
 
     def test_sub_stage_progress_stats_warnings_and_preview(self) -> None:
         progress_written = threading.Event()
@@ -808,7 +842,7 @@ class Phase1BackendTests(unittest.TestCase):
             )
         )
 
-        # Default wired handlers: audio_prep & transcription succeed, then strict OCR fails.
+        # Audio work may be in flight when the OCR credential check fails.
         app = create_app(settings=settings)
         with (
             mock.patch(
@@ -857,7 +891,7 @@ class Phase1BackendTests(unittest.TestCase):
 
                 stages_by_name = {s["stage"]: s["status"] for s in data["stages"]}
                 self.assertEqual(stages_by_name["audio_prep"], "completed")
-                self.assertEqual(stages_by_name["transcription"], "completed")
+                self.assertIn(stages_by_name["transcription"], ("pending", "completed"))
                 self.assertEqual(stages_by_name["ocr"], "failed")
                 self.assertEqual(stages_by_name["alignment"], "pending")
                 self.assertEqual(stages_by_name["notes"], "pending")

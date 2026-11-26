@@ -13,7 +13,7 @@ See [PLAN.md](./PLAN.md) for the phased build plan and architectural guardrails.
   - macOS: `brew install ffmpeg`
 - API credentials (for live transcription, OCR, alignment, and note generation):
   - **Groq API key** (`GROQ_API_KEY`) for Whisper transcription
-  - **Google Gemini API key** (`GEMINI_API_KEY`) — or Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`) — for **Gemini 4 Neon** (`gemini-4-neon`) across structured slide OCR (`LOW` thinking; no `pdfplumber` fallback), alignment (`HIGH` thinking), section Markdown notes (`HIGH` thinking), and transcript coverage audits (`MEDIUM` thinking). *(Note: ensure your Gemini API billing tier / Google AI Studio plan has access to your configured Gemini model.)*
+  - **Google Gemini API key** (`GEMINI_API_KEY`) — or Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`) — for **Gemini 4 Neon** (`gemini-4-neon`) across structured slide OCR (`MEDIUM` thinking; no `pdfplumber` fallback), alignment (`HIGH` thinking), section Markdown notes (`HIGH` thinking), and transcript coverage audits (`MEDIUM` thinking). *(Note: ensure your Gemini API billing tier / Google AI Studio plan has access to your configured Gemini model.)*
 
 ## Setup
 
@@ -118,16 +118,19 @@ All `/api/*` endpoints use a built-in per-IP sliding-window rate limiter (emitti
 - `GET /api/health` & other `/api/*`: `120/min` (`RATE_LIMIT_HEALTH_PER_MINUTE`, `RATE_LIMIT_DEFAULT_PER_MINUTE`)
 - Groq and OCR use independent 20 RPM limits. Slide alignment, notes and coverage share a 30 RPM limit.
 
-Gemini drafts up to four lecture sections at once. Each worker receives a slide outline and the previous four transcript segments for continuity. Coverage checks start as drafts finish, and the final document follows lecture order. Short off-slide remarks between slides stay in the surrounding section with their own timestamp. Sections under 200 transcript characters use a local coverage check.
+Slide OCR runs alongside audio preparation and transcription. Alignment starts once the slide text and transcript are both ready.
+
+Gemini drafts up to nine lecture sections at once. Each worker receives a slide outline and the previous four transcript segments for continuity. Coverage checks start as drafts finish, and the final document follows lecture order. Short off-slide remarks between slides stay in the surrounding section with their own timestamp. Sections under 200 transcript characters use a local coverage check.
 
 | Setting | Default |
 | --- | ---: |
-| `OCR_PARALLEL_WORKERS` | 4 |
-| `OCR_GLOBAL_MAX_CONCURRENT` | 6 |
+| `OCR_MAX_PAGES_PER_BATCH` | 8 |
+| `OCR_PARALLEL_WORKERS` | 8 |
+| `OCR_GLOBAL_MAX_CONCURRENT` | 8 |
 | `LLM_NOTES_MAX_OUTPUT_TOKENS` | 49152 |
-| `LLM_GLOBAL_MAX_CONCURRENT` | 8 |
+| `LLM_GLOBAL_MAX_CONCURRENT` | 12 |
 | `LLM_RATE_LIMIT_RPM` | 30 |
-| `LLM_NOTES_PARALLEL_WORKERS` | 4 |
+| `LLM_NOTES_PARALLEL_WORKERS` | 9 |
 | `LLM_COVERAGE_PARALLEL_WORKERS` | 4 |
 | `NOTES_MAX_SLIDES_PER_SECTION` | 8 |
 | `NOTES_MAX_SECTION_DURATION_SECONDS` | 900.0 |

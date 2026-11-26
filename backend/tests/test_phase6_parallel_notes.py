@@ -43,7 +43,9 @@ def lecture(numbers, durations=None):
 class ParallelNotesTests(unittest.TestCase):
     def test_settings(self):
         defaults = {
-            "LLM_NOTES_PARALLEL_WORKERS": (4, 1), "LLM_COVERAGE_PARALLEL_WORKERS": (4, 1),
+            "LLM_NOTES_PARALLEL_WORKERS": (9, 1), "LLM_COVERAGE_PARALLEL_WORKERS": (4, 1),
+            "OCR_MAX_PAGES_PER_BATCH": (8, 1), "OCR_PARALLEL_WORKERS": (8, 1),
+            "OCR_GLOBAL_MAX_CONCURRENT": (8, 1), "LLM_GLOBAL_MAX_CONCURRENT": (12, 1),
             "NOTES_MAX_SLIDES_PER_SECTION": (8, 1), "NOTES_MAX_SECTION_DURATION_SECONDS": (900, 30),
             "NOTES_MAX_SECTION_TRANSCRIPT_CHARS": (14000, 500),
             "NOTES_INLINE_OFF_SLIDE_MAX_SECONDS": (35, 0), "NOTES_INLINE_OFF_SLIDE_MAX_CHARS": (300, 0),
@@ -57,13 +59,11 @@ class ParallelNotesTests(unittest.TestCase):
                 for key, (default, minimum) in defaults.items():
                     expected = default if override is None else max(minimum, int(override))
                     self.assertEqual(getattr(cfg, key.lower()), expected)
-                self.assertEqual((cfg.ocr_parallel_workers, cfg.ocr_global_max_concurrent,
-                                  cfg.llm_notes_max_output_tokens, cfg.llm_global_max_concurrent,
-                                  cfg.llm_rate_limit_rpm), (4, 6, 49152, 8, 30))
+                self.assertEqual((cfg.llm_notes_max_output_tokens, cfg.llm_rate_limit_rpm), (49152, 30))
 
     def test_pdf_batch_sizes(self):
-        for count, expected in ((5, [3, 2]), (51, [17, 17, 17])):
-            batches = plan_pdf_batches(count, parallel_workers=4)
+        for count, expected in ((5, [3, 2]), (51, [8, 8, 7, 7, 7, 7, 7])):
+            batches = plan_pdf_batches(count)
             self.assertEqual([b.page_end - b.page_start + 1 for b in batches], expected)
 
     def test_flanked_short_off_slide_segment_keeps_its_anchor_and_order(self):
