@@ -41,6 +41,18 @@ export function hasAllowedExtension(filename: string, allowed: readonly string[]
   return allowed.some((ext) => lower.endsWith(ext))
 }
 
+export function formatSlidesDisplayName(slides: readonly File[]): string {
+  if (slides.length === 0) return ''
+  if (slides.length === 1) return slides[0].name
+  const stems = slides.map((file, idx) => {
+    const trimmed = file.name.trim()
+    const dotIndex = trimmed.lastIndexOf('.')
+    const stem = dotIndex > 0 ? trimmed.slice(0, dotIndex).trim() : trimmed
+    return stem || `slides-${idx + 1}`
+  })
+  return `${stems.join(' + ')}.pdf`
+}
+
 export function formatFileSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return ''
   if (bytes < 1024) return `${bytes} B`

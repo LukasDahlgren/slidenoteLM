@@ -413,6 +413,17 @@ describe('slidenoteLM App', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Generate Notes' }))
 
+    // Console details start collapsed by default and can be expanded
+    const toggleConsoleButton = await screen.findByRole('button', { name: /Show console/i })
+    expect(toggleConsoleButton).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByLabelText('Live log output')).not.toBeInTheDocument()
+
+    fireEvent.click(toggleConsoleButton)
+    expect(screen.getByRole('button', { name: /Hide console/i })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    )
+
     await waitFor(() => {
       expect(screen.getAllByText(/Transcribing chunk 1\/2/i).length).toBeGreaterThan(0)
     })
@@ -1269,5 +1280,105 @@ describe('slidenoteLM App', () => {
     await waitFor(() => {
       expect(retriedToken).toBe('tok_failed_prev')
     })
+  })
+
+  it('allows dropping multiple PDFs into the Slides PDF box, reordering them, and uploading them together in order', async () => {
+    let uploadedSlidesNames: string[] = []
+    MockXMLHttpRequest.handler = (formData) => {
+      uploadedSlidesNames = formData.getAll('slides').map((entry) => (entry as File).name)
+      return {
+        status: 202,
+        body: {
+          token: 'tok_multi_pdf',
+          result_url: '/jobs/tok_multi_pdf',
+          status: 'queued',
+          current_stage: 'upload',
+          created_at: '2026-11-26T12:00:00Z',
+        } satisfies JobCreateResponse,
+      }
+    }
+
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/auth/status') return mockJsonResponse(AUTH_DISABLED)
+      if (url.startsWith('/api/queue')) return mockJsonResponse(makeQueueSnapshot())
+      return mockJsonResponse(
+        makeJobStatus({
+          token: 'tok_multi_pdf',
+          slides_filename: 'part1 + part2.pdf',
+          recording_filename: 'lecture.mp4',
+          status: 'completed',
+        }),
+      )
+    })
+
+    render(<App />)
+
+    const recordingInput = await screen.findByLabelText('Video / Audio file input')
+    const slidesBox = screen.getByRole('button', { name: 'Slides PDF' })
+
+    // Select a recording
+    fireEvent.change(recordingInput, {
+      target: { files: [new File(['video'], 'lecture.mp4', { type: 'video/mp4' })] },
+    })
+
+    // Drop first PDF onto the Slides PDF box
+    fireEvent.drop(slidesBox, {
+      dataTransfer: {
+        files: [new File(['%PDF-1.4 a'], 'part2.pdf', { type: 'application/pdf' })],
+      },
+    })
+    expect(screen.getByText('part2.pdf')).toBeInTheDocument()
+
+    // Drop a second and third PDF onto the Slides PDF box -> appends them
+    fireEvent.drop(slidesBox, {
+      dataTransfer: {
+        files: [
+          new File(['%PDF-1.4 b'], 'part1.pdf', { type: 'application/pdf' }),
+          new File(['%PDF-1.4 c'], 'extra.pdf', { type: 'application/pdf' }),
+        ],
+      },
+    })
+
+    expect(screen.getByText('3 PDFs · combined')).toBeInTheDocument()
+
+    // Remove extra.pdf and move part1.pdf above part2.pdf
+    fireEvent.click(screen.getByRole('button', { name: 'Remove extra.pdf' }))
+    expect(screen.getByText('2 PDFs · combined')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Move part1.pdf up' }))
+
+    // Submit and verify both PDFs are appended in the reordered sequence
+    fireEvent.click(screen.getByRole('button', { name: 'Generate Notes' }))
+
+    await waitFor(() => {
+      expect(uploadedSlidesNames).toEqual(['part1.pdf', 'part2.pdf'])
+    })
+  })
+
+  it('toggles between light and dark mode and persists theme in localStorage', async () => {
+    fetchMock.mockImplementation(async (input) => {
+      const url = String(input)
+      if (url === '/api/auth/status') return mockJsonResponse(AUTH_DISABLED)
+      if (url.startsWith('/api/queue')) return mockJsonResponse(makeQueueSnapshot())
+      return mockJsonResponse({}, 404)
+    })
+
+    render(<App />)
+
+    const toggleBtn = await screen.findByRole('button', { name: 'Switch to dark mode' })
+    expect(document.documentElement.getAttribute('data-theme')).toBe('light')
+
+    fireEvent.click(toggleBtn)
+    expect(document.documentElement.getAttribute('data-theme')).toBe('dark')
+    expect(window.localStorage.getItem('slidenotelm:theme')).toBe('dark')
+    expect(screen.getByRole('button', { name: 'Switch to light mode' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Switch to light mode' }))
+    expect(document.documentElement.getAttribute('data-theme')).toBe('light')
+    expect(window.localStorage.getItem('slidenotelm:theme')).toBe('light')
   })
 })

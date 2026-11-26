@@ -192,12 +192,15 @@ export interface CreateJobWithProgressOptions extends CreateJobOptions {
 }
 
 function buildJobFormData(
-  slides: File,
+  slides: File | File[],
   recording: File,
   options?: CreateJobOptions,
 ): FormData {
   const formData = new FormData()
-  formData.append('slides', slides)
+  const slidesList = Array.isArray(slides) ? slides : [slides]
+  for (const slideFile of slidesList) {
+    formData.append('slides', slideFile)
+  }
   formData.append('recording', recording)
   if (options?.batchId) {
     formData.append('batch_id', options.batchId)
@@ -209,7 +212,7 @@ function buildJobFormData(
 }
 
 export async function createJob(
-  slides: File,
+  slides: File | File[],
   recording: File,
   options?: CreateJobOptions,
 ): Promise<JobCreateResponse> {
@@ -238,12 +241,14 @@ export async function createJob(
 }
 
 export function createJobWithProgress(
-  slides: File,
+  slides: File | File[],
   recording: File,
   options?: CreateJobWithProgressOptions,
 ): Promise<JobCreateResponse> {
-  const formData = buildJobFormData(slides, recording, options)
-  const totalBytesFallback = slides.size + recording.size
+  const slidesList = Array.isArray(slides) ? slides : [slides]
+  const formData = buildJobFormData(slidesList, recording, options)
+  const totalBytesFallback =
+    slidesList.reduce((sum, file) => sum + file.size, 0) + recording.size
 
   return new Promise<JobCreateResponse>((resolve, reject) => {
     const signal = options?.signal

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useId, useState } from 'react'
 import { DEFAULT_STAGES } from '../constants'
 import type { ConsoleLogEntry, JobStatusResponse, StageStateResponse } from '../types'
 
@@ -54,6 +54,8 @@ export function LiveConsole({
   onNewUpload,
 }: LiveConsoleProps) {
   const [copied, setCopied] = useState(false)
+  const [isExpanded, setIsExpanded] = useState(false)
+  const consoleBoxId = useId()
 
   const stages: StageStateResponse[] =
     job?.stages && job.stages.length > 0
@@ -199,43 +201,66 @@ export function LiveConsole({
         </div>
       ) : null}
 
-      <div className="console-box" aria-live="polite">
-        <ul className="stage-list" aria-label="Pipeline stages">
-          {stages.map((stage) => (
-            <li
-              key={stage.stage}
-              className={`stage-row stage-row--${stage.status}`}
-              data-stage={stage.stage}
-              data-status={stage.status}
-            >
-              <span className="stage-row__icon" aria-hidden="true">
-                {STAGE_SYMBOL[stage.status]}
-              </span>
-              <span className="stage-row__label">{stage.label}</span>
-              <span className="stage-row__status">{stage.status}</span>
-              {stage.message ? <span className="stage-row__message">{stage.message}</span> : null}
-            </li>
-          ))}
-        </ul>
+      <div className="console-disclosure">
+        <button
+          type="button"
+          className="console-toggle"
+          aria-expanded={isExpanded}
+          aria-controls={consoleBoxId}
+          onClick={() => setIsExpanded((prev) => !prev)}
+        >
+          <span className="console-toggle__left">
+            <span className="console-toggle__chevron" aria-hidden="true">
+              {isExpanded ? '▾' : '▸'}
+            </span>
+            <span>{isExpanded ? 'Hide console' : 'Show console'}</span>
+          </span>
+          <span className="console-toggle__meta">
+            {job?.current_stage_label ?? (isUploading ? 'Upload' : 'Console')}
+            {logs.length > 0 ? ` · ${logs.length} ${logs.length === 1 ? 'entry' : 'entries'}` : ''}
+          </span>
+        </button>
 
-        <div className="console-log" aria-label="Live log output">
-          {logs.length === 0 ? (
-            <div className="console-log__line console-log__line--muted">
-              Waiting for pipeline updates...
+        {isExpanded ? (
+          <div id={consoleBoxId} className="console-box" aria-live="polite">
+            <ul className="stage-list" aria-label="Pipeline stages">
+              {stages.map((stage) => (
+                <li
+                  key={stage.stage}
+                  className={`stage-row stage-row--${stage.status}`}
+                  data-stage={stage.stage}
+                  data-status={stage.status}
+                >
+                  <span className="stage-row__icon" aria-hidden="true">
+                    {STAGE_SYMBOL[stage.status]}
+                  </span>
+                  <span className="stage-row__label">{stage.label}</span>
+                  <span className="stage-row__status">{stage.status}</span>
+                  {stage.message ? <span className="stage-row__message">{stage.message}</span> : null}
+                </li>
+              ))}
+            </ul>
+
+            <div className="console-log" aria-label="Live log output">
+              {logs.length === 0 ? (
+                <div className="console-log__line console-log__line--muted">
+                  Waiting for pipeline updates...
+                </div>
+              ) : (
+                logs.map((entry) => (
+                  <div
+                    key={entry.key}
+                    className={`console-log__line console-log__line--${entry.status}`}
+                  >
+                    <span className="console-log__time">[{entry.timestamp}]</span>{' '}
+                    <span className="console-log__stage">{entry.label}:</span>{' '}
+                    <span>{entry.message}</span>
+                  </div>
+                ))
+              )}
             </div>
-          ) : (
-            logs.map((entry) => (
-              <div
-                key={entry.key}
-                className={`console-log__line console-log__line--${entry.status}`}
-              >
-                <span className="console-log__time">[{entry.timestamp}]</span>{' '}
-                <span className="console-log__stage">{entry.label}:</span>{' '}
-                <span>{entry.message}</span>
-              </div>
-            ))
-          )}
-        </div>
+          </div>
+        ) : null}
       </div>
 
       {job && job.warnings.length > 0 ? (

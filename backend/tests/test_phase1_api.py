@@ -926,6 +926,88 @@ class Phase1BackendTests(unittest.TestCase):
                 self.assertFalse(slides_ocr_file.exists())
                 self.assertEqual(client.get(f"/api/jobs/{token}/download").status_code, 409)
 
+    def test_multiple_slides_pdfs_are_concatenated_in_order(self) -> None:
+        pdf_part1 = _build_pdf_bytes(["Part 1 Slide A", "Part 1 Slide B"])
+        pdf_part2 = _build_pdf_bytes(["Part 2 Slide C"])
+        settings = _make_settings(self.tmp_dir)
+        app = create_app(settings=settings, stage_handlers=_phase1_stub_handlers())
+
+        with TestClient(app) as client:
+            resp = client.post(
+                "/api/jobs",
+                files=[
+                    ("slides", ("Lecture Part 1.pdf", pdf_part1, "application/pdf")),
+                    ("slides", ("Lecture Part 2.pdf", pdf_part2, "application/pdf")),
+                    ("recording", ("lecture.mp3", b"ID3-audio", "audio/mpeg")),
+                ],
+            )
+            self.assertEqual(resp.status_code, 202, resp.text)
+            token = resp.json()["token"]
+            app.state.worker.wait_for_job(token, timeout=5.0)
+
+            status_resp = client.get(f"/api/jobs/{token}")
+            self.assertEqual(status_resp.status_code, 200)
+            data = status_resp.json()
+            self.assertEqual(data["status"], "completed")
+            self.assertEqual(data["slides_filename"], "Lecture Part 1 + Lecture Part 2.pdf")
+            self.assertEqual(data["download_filename"], "lecture-part-1-lecture-part-2-notes.md")
+
+            merged_pdf_path = settings.jobs_dir / token / "input" / "slides.pdf"
+            self.assertTrue(merged_pdf_path.is_file())
+            # Ensure temp part files were cleaned up
+            part_files = list((settings.jobs_dir / token / "input").glob("slides_part_*.pdf"))
+            self.assertEqual(part_files, [])
+
+            with pymupdf.open(merged_pdf_path) as merged_doc:
+                self.assertEqual(len(merged_doc), 3)
+                page_texts = [page.get_text("text").strip() for page in merged_doc]
+            self.assertEqual(page_texts, ["Part 1 Slide A", "Part 1 Slide B", "Part 2 Slide C"])
+
+    def test_multiple_slides_pdfs_validation_and_combined_size_limit(self) -> None:
+        pdf_part1 = _build_pdf_bytes(["Slide 1"])
+        pdf_part2 = _build_pdf_bytes(["Slide 2"])
+        # Allow each single PDF individually, but reject their combined size.
+        combined_limit = len(pdf_part1) + len(pdf_part2) - 10
+        settings = _make_settings(self.tmp_dir, max_pdf_bytes=combined_limit)
+        app = create_app(settings=settings, stage_handlers=_phase1_stub_handlers())
+
+        with TestClient(app) as client:
+            # Non-PDF second file rejected
+            resp = client.post(
+                "/api/jobs",
+                files=[
+                    ("slides", ("part1.pdf", pdf_part1, "application/pdf")),
+                    ("slides", ("part2.txt", b"not a pdf", "text/plain")),
+                    ("recording", ("lecture.mp3", b"ID3-audio", "audio/mpeg")),
+                ],
+            )
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn(".pdf", resp.json()["detail"])
+
+            # Corrupt second PDF (has %PDF- header but invalid structure) rejected
+            resp = client.post(
+                "/api/jobs",
+                files=[
+                    ("slides", ("part1.pdf", pdf_part1, "application/pdf")),
+                    ("slides", ("part2.pdf", b"%PDF-1.4\ncorrupted-body", "application/pdf")),
+                    ("recording", ("lecture.mp3", b"ID3-audio", "audio/mpeg")),
+                ],
+            )
+            self.assertEqual(resp.status_code, 400)
+
+            # Combined size exceeding max_pdf_bytes rejected with 413
+            resp = client.post(
+                "/api/jobs",
+                files=[
+                    ("slides", ("part1.pdf", pdf_part1, "application/pdf")),
+                    ("slides", ("part2.pdf", pdf_part2, "application/pdf")),
+                    ("recording", ("lecture.mp3", b"ID3-audio", "audio/mpeg")),
+                ],
+            )
+            self.assertEqual(resp.status_code, 413)
+
+        self.assertEqual(list(settings.jobs_dir.iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

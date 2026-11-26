@@ -6,13 +6,14 @@ import {
   SLIDES_ACCEPT,
   SLIDES_EXTENSIONS,
   formatFileSize,
+  formatSlidesDisplayName,
 } from '../constants'
 import type { StagedLecturePair, UnpairedFile } from '../types'
 import { UploadBox } from './UploadBox'
 
 interface QueueComposerProps {
   recordingFile: File | null
-  slidesFile: File | null
+  slidesFiles: File[]
   stagedPairs: StagedLecturePair[]
   unpairedRecordings: UnpairedFile[]
   unpairedSlides: UnpairedFile[]
@@ -23,7 +24,7 @@ interface QueueComposerProps {
   uploadError: string | null
   allUploadedNotice: boolean
   onRecordingChange: (file: File | null) => void
-  onSlidesChange: (file: File | null) => void
+  onSlidesChange: (files: File[]) => void
   onBulkFilesDrop: (files: File[]) => void
   onStageCurrentPair: () => void
   onSubmitImmediate: () => void
@@ -41,7 +42,7 @@ interface QueueComposerProps {
 
 export function QueueComposer({
   recordingFile,
-  slidesFile,
+  slidesFiles,
   stagedPairs,
   unpairedRecordings,
   unpairedSlides,
@@ -78,7 +79,7 @@ export function QueueComposer({
     ? selectedUnpairedSlideId
     : null
 
-  const hasCompletePair = Boolean(recordingFile && slidesFile)
+  const hasCompletePair = Boolean(recordingFile && slidesFiles.length > 0)
   const readyStagedCount = stagedPairs.filter(
     (pair) => pair.status === 'staged' || pair.status === 'upload_error',
   ).length
@@ -137,14 +138,13 @@ export function QueueComposer({
 
         <UploadBox
           title="Slides PDF"
-          subtitle="PDF document (.pdf)"
+          subtitle="PDF document (.pdf) — drop multiple to concatenate"
           accept={SLIDES_ACCEPT}
           allowedExtensions={SLIDES_EXTENSIONS}
-          invalidTypeMessage="Please select a valid .pdf slides file."
-          file={slidesFile}
+          invalidTypeMessage="Please select valid .pdf slides files."
+          files={slidesFiles}
           multiple
-          onFileChange={onSlidesChange}
-          onFilesSelect={onBulkFilesDrop}
+          onFilesChange={onSlidesChange}
         />
       </div>
 
@@ -347,6 +347,7 @@ export function QueueComposer({
           <ul className="staging-list">
             {stagedPairs.map((pair, index) => {
               const isUploading = pair.status === 'uploading'
+              const slidesDisplayName = formatSlidesDisplayName(pair.slides)
               const canMoveUp =
                 !isUploading && index > 0 && stagedPairs[index - 1]?.status !== 'uploading'
               const canMoveDown =
@@ -368,8 +369,11 @@ export function QueueComposer({
                       <span className="divider-dot" aria-hidden="true">
                         +
                       </span>
-                      <span className="staging-item__filename" title={pair.slides.name}>
-                        {pair.slides.name}
+                      <span
+                        className="staging-item__filename"
+                        title={pair.slides.map((file) => file.name).join(' + ')}
+                      >
+                        {slidesDisplayName}
                       </span>
                     </div>
 
@@ -418,7 +422,7 @@ export function QueueComposer({
                     <button
                       type="button"
                       className="btn btn--ghost btn--sm icon-btn"
-                      aria-label={`Move staged pair ${pair.slides.name} up`}
+                      aria-label={`Move staged pair ${slidesDisplayName} up`}
                       disabled={!canMoveUp}
                       onClick={() => onMoveStagedPair(pair.id, -1)}
                     >
@@ -427,7 +431,7 @@ export function QueueComposer({
                     <button
                       type="button"
                       className="btn btn--ghost btn--sm icon-btn"
-                      aria-label={`Move staged pair ${pair.slides.name} down`}
+                      aria-label={`Move staged pair ${slidesDisplayName} down`}
                       disabled={!canMoveDown}
                       onClick={() => onMoveStagedPair(pair.id, 1)}
                     >
@@ -438,8 +442,8 @@ export function QueueComposer({
                       className="btn btn--ghost btn--sm icon-btn"
                       aria-label={
                         isUploading
-                          ? `Abort upload for ${pair.slides.name}`
-                          : `Remove staged pair ${pair.slides.name}`
+                          ? `Abort upload for ${slidesDisplayName}`
+                          : `Remove staged pair ${slidesDisplayName}`
                       }
                       onClick={() => onRemoveStagedPair(pair.id)}
                     >

@@ -163,7 +163,7 @@ export type StagedPairStatus =
 export interface StagedLecturePair {
   id: string
   recording: File
-  slides: File
+  slides: File[]
   label: string | null
   batchId: string | null
   status: StagedPairStatus

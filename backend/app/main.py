@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 import shutil
 from contextlib import asynccontextmanager
@@ -7,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import AsyncIterator
 
+import pymupdf
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -58,6 +60,16 @@ def sanitize_filename(filename: str | None, fallback: str) -> str:
         return fallback
     cleaned = Path(filename).name.strip()
     return cleaned or fallback
+
+
+def build_combined_slides_filename(filenames: list[str]) -> str:
+    if len(filenames) == 1:
+        return filenames[0]
+    stems = [
+        Path(name).stem.strip() or f"slides-{idx + 1}"
+        for idx, name in enumerate(filenames)
+    ]
+    return f"{' + '.join(stems)}.pdf"
 
 
 def build_download_filename(slides_filename: str) -> str:
@@ -169,6 +181,33 @@ async def _save_upload_file(
         )
 
     return total_bytes
+
+
+def _concatenate_pdfs(part_paths: list[Path], destination: Path) -> None:
+    merged = pymupdf.open()
+    try:
+        for idx, part_path in enumerate(part_paths):
+            try:
+                src = pymupdf.open(stream=part_path.read_bytes(), filetype="pdf")
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Uploaded slides PDF #{idx + 1} could not be read as a valid PDF.",
+                ) from exc
+            try:
+                if len(src) == 0:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"Uploaded slides PDF #{idx + 1} has no pages.",
+                    )
+                merged.insert_pdf(src)
+            finally:
+                src.close()
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        merged.save(destination)
+    finally:
+        merged.close()
 
 
 def _build_job_error(job: dict) -> JobErrorResponse | None:
@@ -516,27 +555,45 @@ def create_app(
         status_code=status.HTTP_202_ACCEPTED,
     )
     async def create_job(
-        slides: UploadFile = File(...),
+        slides: list[UploadFile] = File(...),
         recording: UploadFile = File(...),
         batch_id: str | None = Form(default=None),
         label: str | None = Form(default=None),
     ) -> JobCreateResponse:
-        slides_name = sanitize_filename(slides.filename, "slides.pdf")
-        recording_name = sanitize_filename(recording.filename, "recording")
-
-        slides_ext = Path(slides_name).suffix.lower()
-        if slides_ext != ".pdf":
-            await slides.close()
+        async def _close_uploads() -> None:
+            for slide_upload in slides:
+                await slide_upload.close()
             await recording.close()
+
+        if not slides:
+            await _close_uploads()
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Slides upload must be a .pdf file.",
+                detail="At least one slides .pdf file is required.",
             )
+
+        slides_names = [
+            sanitize_filename(
+                slide_upload.filename,
+                f"slides-{idx + 1}.pdf" if len(slides) > 1 else "slides.pdf",
+            )
+            for idx, slide_upload in enumerate(slides)
+        ]
+        recording_name = sanitize_filename(recording.filename, "recording")
+
+        for name in slides_names:
+            if Path(name).suffix.lower() != ".pdf":
+                await _close_uploads()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Slides upload must be a .pdf file.",
+                )
+
+        slides_name = build_combined_slides_filename(slides_names)
 
         recording_ext = Path(recording_name).suffix.lower()
         if recording_ext not in resolved_settings.allowed_recording_extensions:
-            await slides.close()
-            await recording.close()
+            await _close_uploads()
             allowed_list = ", ".join(resolved_settings.allowed_recording_extensions)
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -550,8 +607,7 @@ def create_app(
             resolved_settings.max_queue_depth > 0
             and store.count_active_and_queued_jobs() >= resolved_settings.max_queue_depth
         ):
-            await slides.close()
-            await recording.close()
+            await _close_uploads()
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
@@ -564,8 +620,7 @@ def create_app(
             resolved_settings.jobs_dir.mkdir(parents=True, exist_ok=True)
             free_bytes = shutil.disk_usage(resolved_settings.jobs_dir).free
             if free_bytes < resolved_settings.min_free_disk_bytes:
-                await slides.close()
-                await recording.close()
+                await _close_uploads()
                 min_mb = resolved_settings.min_free_disk_bytes // (1024 * 1024)
                 raise HTTPException(
                     status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
@@ -584,13 +639,50 @@ def create_app(
             (job_dir / "input").mkdir(parents=True, exist_ok=True)
             (job_dir / "artifacts").mkdir(parents=True, exist_ok=True)
 
-            await _save_upload_file(
-                slides,
-                job_dir / slides_rel,
-                max_bytes=resolved_settings.max_pdf_bytes,
-                label="Slides PDF",
-                require_pdf_header=True,
-            )
+            if len(slides) == 1:
+                await _save_upload_file(
+                    slides[0],
+                    job_dir / slides_rel,
+                    max_bytes=resolved_settings.max_pdf_bytes,
+                    label="Slides PDF",
+                    require_pdf_header=True,
+                )
+            else:
+                part_paths: list[Path] = []
+                total_pdf_bytes = 0
+                try:
+                    for idx, slide_upload in enumerate(slides):
+                        remaining_bytes = max(0, resolved_settings.max_pdf_bytes - total_pdf_bytes)
+                        part_path = job_dir / "input" / f"slides_part_{idx:03d}.pdf"
+                        part_paths.append(part_path)
+                        try:
+                            written = await _save_upload_file(
+                                slide_upload,
+                                part_path,
+                                max_bytes=remaining_bytes,
+                                label="Slides PDF",
+                                require_pdf_header=True,
+                            )
+                        except HTTPException as exc:
+                            if exc.status_code == status.HTTP_413_CONTENT_TOO_LARGE:
+                                raise HTTPException(
+                                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                                    detail=(
+                                        "Combined Slides PDF files exceed the maximum allowed "
+                                        f"size of {resolved_settings.max_pdf_bytes} bytes."
+                                    ),
+                                ) from exc
+                            raise
+                        total_pdf_bytes += written
+
+                    await asyncio.to_thread(_concatenate_pdfs, part_paths, job_dir / slides_rel)
+                finally:
+                    for part_path in part_paths:
+                        try:
+                            part_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+
             await _save_upload_file(
                 recording,
                 job_dir / recording_rel,
@@ -602,8 +694,7 @@ def create_app(
             shutil.rmtree(job_dir, ignore_errors=True)
             raise
         finally:
-            await slides.close()
-            await recording.close()
+            await _close_uploads()
 
         job = store.create_job(
             slides_filename=slides_name,

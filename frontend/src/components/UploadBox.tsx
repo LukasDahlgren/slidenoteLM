@@ -8,10 +8,12 @@ interface UploadBoxProps {
   accept: string
   allowedExtensions: readonly string[]
   invalidTypeMessage: string
-  file: File | null
+  file?: File | null
+  files?: File[]
   disabled?: boolean
   multiple?: boolean
-  onFileChange: (file: File | null) => void
+  onFileChange?: (file: File | null) => void
+  onFilesChange?: (files: File[]) => void
   onFilesSelect?: (files: File[]) => void
 }
 
@@ -21,10 +23,12 @@ export function UploadBox({
   accept,
   allowedExtensions,
   invalidTypeMessage,
-  file,
+  file = null,
+  files,
   disabled = false,
   multiple = false,
   onFileChange,
+  onFilesChange,
   onFilesSelect,
 }: UploadBoxProps) {
   const inputId = useId()
@@ -32,24 +36,56 @@ export function UploadBox({
   const [isDragging, setIsDragging] = useState(false)
   const [validationError, setValidationError] = useState<string | null>(null)
 
+  const isMultiFileList = files !== undefined && onFilesChange !== undefined
+  const selectedFiles = isMultiFileList ? files : file ? [file] : []
+  const hasSelection = selectedFiles.length > 0
+
   const handleSelectedFiles = (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0) return
-    const files = Array.from(fileList)
+    const incoming = Array.from(fileList)
 
-    if (files.length > 1 && onFilesSelect) {
+    if (isMultiFileList) {
+      const allValid = incoming.every((candidate) =>
+        hasAllowedExtension(candidate.name, allowedExtensions),
+      )
+      if (!allValid) {
+        setValidationError(invalidTypeMessage)
+        return
+      }
       setValidationError(null)
-      onFilesSelect(files)
+      onFilesChange([...files, ...incoming])
       return
     }
 
-    const candidate = files[0]
+    if (incoming.length > 1 && onFilesSelect) {
+      setValidationError(null)
+      onFilesSelect(incoming)
+      return
+    }
+
+    const candidate = incoming[0]
     if (!candidate) return
     if (!hasAllowedExtension(candidate.name, allowedExtensions)) {
       setValidationError(invalidTypeMessage)
       return
     }
     setValidationError(null)
-    onFileChange(candidate)
+    onFileChange?.(candidate)
+  }
+
+  const handleMoveFile = (index: number, direction: -1 | 1) => {
+    if (!isMultiFileList) return
+    const targetIndex = index + direction
+    if (targetIndex < 0 || targetIndex >= files.length) return
+    const next = files.slice()
+    const [moved] = next.splice(index, 1)
+    next.splice(targetIndex, 0, moved)
+    onFilesChange(next)
+  }
+
+  const handleRemoveFileAt = (index: number) => {
+    if (!isMultiFileList) return
+    onFilesChange(files.filter((_, idx) => idx !== index))
   }
 
   const handleInputChange = (event: ChangeEvent<HTMLInputElement>) => {
@@ -86,16 +122,19 @@ export function UploadBox({
   }
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    if (event.target !== event.currentTarget) return
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
       triggerPicker()
     }
   }
 
+  const totalBytes = selectedFiles.reduce((sum, item) => sum + item.size, 0)
+
   const boxClasses = [
     'upload-box',
     isDragging ? 'upload-box--dragging' : '',
-    file ? 'upload-box--selected' : '',
+    hasSelection ? 'upload-box--selected' : '',
     validationError ? 'upload-box--error' : '',
     disabled ? 'upload-box--disabled' : '',
   ]
@@ -121,7 +160,7 @@ export function UploadBox({
           id={inputId}
           type="file"
           accept={accept}
-          multiple={multiple}
+          multiple={multiple || isMultiFileList}
           aria-label={`${title} file input`}
           className="sr-only"
           disabled={disabled}
@@ -129,8 +168,15 @@ export function UploadBox({
         />
 
         <div className="upload-box__header">
-          <span className="upload-box__title">{title}</span>
-          {file ? (
+          <div className="upload-box__title-group">
+            <span className="upload-box__title">{title}</span>
+            {isMultiFileList && selectedFiles.length > 1 ? (
+              <span className="upload-box__badge">
+                {selectedFiles.length} PDFs · combined
+              </span>
+            ) : null}
+          </div>
+          {hasSelection ? (
             <button
               type="button"
               className="upload-box__clear"
@@ -138,25 +184,93 @@ export function UploadBox({
               onClick={(event) => {
                 event.stopPropagation()
                 setValidationError(null)
-                onFileChange(null)
+                if (isMultiFileList) {
+                  onFilesChange([])
+                } else {
+                  onFileChange?.(null)
+                }
               }}
             >
-              Remove
+              {isMultiFileList && selectedFiles.length > 1 ? 'Clear' : 'Remove'}
             </button>
           ) : null}
         </div>
 
-        {file ? (
-          <div className="upload-box__file">
-            <span className="upload-box__filename" title={file.name}>
-              {file.name}
+        {isMultiFileList && selectedFiles.length > 1 ? (
+          <div className="upload-box__multi">
+            <ul className="upload-box__file-list">
+              {selectedFiles.map((item, index) => (
+                <li key={`${item.name}-${item.size}-${index}`} className="upload-box__file-row">
+                  <span className="upload-box__file-order">{index + 1}.</span>
+                  <span className="upload-box__file-name" title={item.name}>
+                    {item.name}
+                  </span>
+                  <span className="upload-box__file-size">{formatFileSize(item.size)}</span>
+                  <div className="upload-box__file-actions">
+                    <button
+                      type="button"
+                      className="upload-box__row-btn"
+                      aria-label={`Move ${item.name} up`}
+                      disabled={disabled || index === 0}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handleMoveFile(index, -1)
+                      }}
+                    >
+                      ↑
+                    </button>
+                    <button
+                      type="button"
+                      className="upload-box__row-btn"
+                      aria-label={`Move ${item.name} down`}
+                      disabled={disabled || index === selectedFiles.length - 1}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handleMoveFile(index, 1)
+                      }}
+                    >
+                      ↓
+                    </button>
+                    <button
+                      type="button"
+                      className="upload-box__row-btn upload-box__row-btn--remove"
+                      aria-label={`Remove ${item.name}`}
+                      disabled={disabled}
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        handleRemoveFileAt(index)
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <span className="upload-box__add-more">
+              Total {formatFileSize(totalBytes)} · Drop or click to add another PDF
             </span>
-            <span className="upload-box__meta">{formatFileSize(file.size)}</span>
+          </div>
+        ) : hasSelection ? (
+          <div className="upload-box__file">
+            <span className="upload-box__filename" title={selectedFiles[0].name}>
+              {selectedFiles[0].name}
+            </span>
+            <span className="upload-box__meta">{formatFileSize(selectedFiles[0].size)}</span>
+            {isMultiFileList ? (
+              <span className="upload-box__add-more">
+                Drop or click to add another PDF to concatenate
+              </span>
+            ) : null}
           </div>
         ) : (
           <div className="upload-box__placeholder">
             <span className="upload-box__prompt">
-              {multiple ? 'Drop file(s) here or click to browse' : 'Drop file here or click to browse'}
+              {isMultiFileList
+                ? 'Drop one or more PDFs here or click to browse'
+                : multiple
+                  ? 'Drop file(s) here or click to browse'
+                  : 'Drop file here or click to browse'}
             </span>
             <span className="upload-box__hint">{subtitle}</span>
           </div>

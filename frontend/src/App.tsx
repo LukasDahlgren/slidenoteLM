@@ -24,6 +24,7 @@ import {
   QUEUE_POLL_HIDDEN_INTERVAL_MS,
   QUEUE_POLL_INTERVAL_MS,
   formatLogTime,
+  formatSlidesDisplayName,
 } from './constants'
 import {
   createEntryFromStatus,
@@ -48,6 +49,26 @@ import type {
 } from './types'
 
 let unpairedCounter = 0
+const THEME_STORAGE_KEY = 'slidenotelm:theme'
+type ThemeMode = 'light' | 'dark'
+
+function getInitialTheme(): ThemeMode {
+  try {
+    const saved = window.localStorage.getItem(THEME_STORAGE_KEY)
+    if (saved === 'dark' || saved === 'light') {
+      return saved
+    }
+  } catch {
+    // Ignore storage read errors
+  }
+  if (
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(prefers-color-scheme: dark)').matches
+  ) {
+    return 'dark'
+  }
+  return 'light'
+}
 
 function makeUnpairedFile(file: File): UnpairedFile {
   unpairedCounter += 1
@@ -127,6 +148,7 @@ function updateLogsWithCap(
 }
 
 export function App() {
+  const [theme, setTheme] = useState<ThemeMode>(getInitialTheme)
   const [authChecked, setAuthChecked] = useState(false)
   const [authRequired, setAuthRequired] = useState(false)
   const [authenticated, setAuthenticated] = useState(false)
@@ -136,7 +158,7 @@ export function App() {
   const [isLoggingOut, setIsLoggingOut] = useState(false)
 
   const [recordingFile, setRecordingFile] = useState<File | null>(null)
-  const [slidesFile, setSlidesFile] = useState<File | null>(null)
+  const [slidesFiles, setSlidesFiles] = useState<File[]>([])
   const [unpairedRecordings, setUnpairedRecordings] = useState<UnpairedFile[]>([])
   const [unpairedSlides, setUnpairedSlides] = useState<UnpairedFile[]>([])
   const [rejectedFiles, setRejectedFiles] = useState<string[]>([])
@@ -214,6 +236,7 @@ export function App() {
   const handleJobEnqueued = useCallback(
     (created: JobCreateResponse, pair: StagedLecturePair) => {
       const nowIso = new Date().toISOString()
+      const slidesDisplayName = formatSlidesDisplayName(pair.slides)
       const uploadEntries: ConsoleLogEntry[] = [
         {
           key: `upload-complete:${created.token}`,
@@ -221,7 +244,7 @@ export function App() {
           stage: 'upload',
           label: 'Upload',
           status: 'completed',
-          message: `Uploaded ${pair.recording.name} and ${pair.slides.name}. Queued for processing.`,
+          message: `Uploaded ${pair.recording.name} and ${slidesDisplayName}. Queued for processing.`,
         },
       ]
 
@@ -230,7 +253,7 @@ export function App() {
       setHistory((prev) => {
         const updated = upsertHistoryEntry(
           prev,
-          createEntryFromUpload(created, pair.slides.name, pair.recording.name, pair.label),
+          createEntryFromUpload(created, slidesDisplayName, pair.recording.name, pair.label),
         )
         saveHistory(updated)
         return updated
@@ -262,6 +285,20 @@ export function App() {
     onJobEnqueued: handleJobEnqueued,
     onAuthExpired: handleAuthExpired,
   })
+
+  // Sync theme to document attribute and persist preference
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, theme)
+    } catch {
+      // Ignore storage quota / private-mode errors
+    }
+  }, [theme])
+
+  const handleToggleTheme = () => {
+    setTheme((prev) => (prev === 'dark' ? 'light' : 'dark'))
+  }
 
   // Check initial authentication status
   useEffect(() => {
@@ -571,38 +608,40 @@ export function App() {
     setRecordingFile(file)
   }
 
-  const handleSlidesChange = (file: File | null) => {
+  const handleSlidesChange = (files: File[]) => {
     setUploadError(null)
     dismissAllUploadedNotice()
-    setSlidesFile(file)
+    setSlidesFiles(files)
   }
 
   const handleStageCurrentPair = () => {
-    if (!recordingFile || !slidesFile) return
+    if (!recordingFile || slidesFiles.length === 0) return
     setUploadError(null)
-    stagePairs([{ recording: recordingFile, slides: slidesFile }])
+    stagePairs([{ recording: recordingFile, slides: slidesFiles }])
     setRecordingFile(null)
-    setSlidesFile(null)
+    setSlidesFiles([])
   }
 
   const handleSubmitImmediate = () => {
-    if (!recordingFile || !slidesFile) return
+    if (!recordingFile || slidesFiles.length === 0) return
     setUploadError(null)
     setAutoFollowActive(true)
-    enqueueImmediatePair(recordingFile, slidesFile)
+    enqueueImmediatePair(recordingFile, slidesFiles)
     setRecordingFile(null)
-    setSlidesFile(null)
+    setSlidesFiles([])
   }
 
   const handleStartStagedUploads = () => {
     setUploadError(null)
     setAutoFollowActive(true)
     const extraPair =
-      recordingFile && slidesFile ? { recording: recordingFile, slides: slidesFile } : null
+      recordingFile && slidesFiles.length > 0
+        ? { recording: recordingFile, slides: slidesFiles }
+        : null
     startAllStagedUploads(extraPair)
     if (extraPair) {
       setRecordingFile(null)
-      setSlidesFile(null)
+      setSlidesFiles([])
     }
   }
 
@@ -615,7 +654,7 @@ export function App() {
       ...unpairedRecordings.map((item) => item.file),
     ]
     const existingSlides = [
-      ...(slidesFile ? [slidesFile] : []),
+      ...slidesFiles,
       ...unpairedSlides.map((item) => item.file),
     ]
 
@@ -626,25 +665,25 @@ export function App() {
     }
 
     if (result.pairs.length > 0) {
-      stagePairs(result.pairs.map((p) => ({ recording: p.recording, slides: p.slides })))
+      stagePairs(result.pairs.map((p) => ({ recording: p.recording, slides: [p.slides] })))
       setRecordingFile(null)
-      setSlidesFile(null)
+      setSlidesFiles([])
       setUnpairedRecordings(result.unpairedRecordings.map(makeUnpairedFile))
       setUnpairedSlides(result.unpairedSlides.map(makeUnpairedFile))
       return
     }
 
-    // No new pairs yet: populate the 2 single-file boxes when at most 1 of each exists.
+    // No new pairs yet: populate the 2 upload boxes when at most 1 of each exists.
     if (result.unpairedRecordings.length <= 1 && result.unpairedSlides.length <= 1) {
       setRecordingFile(result.unpairedRecordings[0] ?? null)
-      setSlidesFile(result.unpairedSlides[0] ?? null)
+      setSlidesFiles(result.unpairedSlides)
       setUnpairedRecordings([])
       setUnpairedSlides([])
       return
     }
 
     setRecordingFile(null)
-    setSlidesFile(null)
+    setSlidesFiles([])
     setUnpairedRecordings(result.unpairedRecordings.map(makeUnpairedFile))
     setUnpairedSlides(result.unpairedSlides.map(makeUnpairedFile))
   }
@@ -864,7 +903,7 @@ export function App() {
     setIsLoadingJob(false)
     setUploadError(null)
     setRecordingFile(null)
-    setSlidesFile(null)
+    setSlidesFiles([])
     if (window.location.pathname !== '/') {
       window.history.pushState({}, '', '/')
     }
@@ -885,7 +924,7 @@ export function App() {
           stage: 'upload',
           label: 'Upload',
           status: 'running',
-          message: `Uploading ${uploadingPair.recording.name} and ${uploadingPair.slides.name} (${uploadingPair.uploadPct}%). Keep this tab open until the upload finishes.`,
+          message: `Uploading ${uploadingPair.recording.name} and ${formatSlidesDisplayName(uploadingPair.slides)} (${uploadingPair.uploadPct}%). Keep this tab open until the upload finishes.`,
         },
       ]
     : []
@@ -906,16 +945,27 @@ export function App() {
               study notes.
             </p>
           </div>
-          {authChecked && authRequired && authenticated ? (
+          <div className="app-header__actions">
             <button
               type="button"
-              className="btn btn--ghost btn--sm app-header__signout"
-              disabled={isLoggingOut}
-              onClick={() => void handleLogout()}
+              className="btn btn--ghost btn--sm"
+              aria-pressed={theme === 'dark'}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              onClick={handleToggleTheme}
             >
-              {isLoggingOut ? 'Signing out...' : 'Sign out'}
+              {theme === 'dark' ? '☀ Light' : '☾ Dark'}
             </button>
-          ) : null}
+            {authChecked && authRequired && authenticated ? (
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm app-header__signout"
+                disabled={isLoggingOut}
+                onClick={() => void handleLogout()}
+              >
+                {isLoggingOut ? 'Signing out...' : 'Sign out'}
+              </button>
+            ) : null}
+          </div>
         </div>
       </header>
 
@@ -968,7 +1018,7 @@ export function App() {
           <>
             <QueueComposer
               recordingFile={recordingFile}
-              slidesFile={slidesFile}
+              slidesFiles={slidesFiles}
               stagedPairs={stagedPairs}
               unpairedRecordings={unpairedRecordings}
               unpairedSlides={unpairedSlides}

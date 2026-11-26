@@ -278,27 +278,31 @@ export function useUploadPump({
   const makeStagedPair = useCallback(
     (
       recording: File,
-      slides: File,
+      slides: File | File[],
       status: 'staged' | 'waiting',
       batchId: string | null = null,
-    ): StagedLecturePair => ({
-      id: nextPairId(),
-      recording,
-      slides,
-      label: null,
-      batchId,
-      status,
-      uploadPct: 0,
-      loadedBytes: 0,
-      totalBytes: recording.size + slides.size,
-      retryAfterSeconds: null,
-      errorMessage: null,
-    }),
+    ): StagedLecturePair => {
+      const slidesList = Array.isArray(slides) ? slides : [slides]
+      const slidesBytes = slidesList.reduce((sum, file) => sum + file.size, 0)
+      return {
+        id: nextPairId(),
+        recording,
+        slides: slidesList,
+        label: null,
+        batchId,
+        status,
+        uploadPct: 0,
+        loadedBytes: 0,
+        totalBytes: recording.size + slidesBytes,
+        retryAfterSeconds: null,
+        errorMessage: null,
+      }
+    },
     [],
   )
 
   const stagePairs = useCallback(
-    (pairs: Array<{ recording: File; slides: File }>) => {
+    (pairs: Array<{ recording: File; slides: File | File[] }>) => {
       if (pairs.length === 0) return
       setAllUploadedNotice(false)
       setStagedPairs((prev) => [
@@ -310,7 +314,7 @@ export function useUploadPump({
   )
 
   const enqueueImmediatePair = useCallback(
-    (recording: File, slides: File) => {
+    (recording: File, slides: File | File[]) => {
       setAllUploadedNotice(false)
       setStagedPairs((prev) => [...prev, makeStagedPair(recording, slides, 'waiting')])
     },
@@ -318,7 +322,7 @@ export function useUploadPump({
   )
 
   const startAllStagedUploads = useCallback(
-    (extraPair?: { recording: File; slides: File } | null) => {
+    (extraPair?: { recording: File; slides: File | File[] } | null) => {
       setAllUploadedNotice(false)
       setStagedPairs((prev) => {
         const nextList = extraPair
