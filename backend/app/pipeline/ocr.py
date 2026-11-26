@@ -19,7 +19,13 @@ import pymupdf
 from google import genai
 from google.genai import types
 
-from ..config import DEFAULT_OCR_MODEL_GOOGLE, DEFAULT_OCR_THINKING_LEVEL, Settings
+from ..config import (
+    DEFAULT_OCR_GLOBAL_MAX_CONCURRENT,
+    DEFAULT_OCR_MODEL_GOOGLE,
+    DEFAULT_OCR_PARALLEL_WORKERS,
+    DEFAULT_OCR_THINKING_LEVEL,
+    Settings,
+)
 from ..ratelimit import OutboundRateLimiter
 from ..schemas import (
     ARTIFACT_SLIDES_OCR,
@@ -45,9 +51,7 @@ JitterFn = Callable[[float, float], float]
 DEFAULT_OCR_MODEL = DEFAULT_OCR_MODEL_GOOGLE
 DEFAULT_OCR_MAX_PAGES_PER_BATCH = 20
 DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # Safely below Gemini's 20 MB inline payload limit
-DEFAULT_OCR_PARALLEL_WORKERS = 2
 DEFAULT_OCR_PARALLEL_MIN_PAGES = 4
-DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 4
 DEFAULT_OCR_RATE_LIMIT_RPM = 20
 DEFAULT_OCR_RETRY_ATTEMPTS = 3
 DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS = 2.0
@@ -653,7 +657,8 @@ def plan_pdf_batches(
 
     min_batches = math.ceil(page_count / resolved_max_pages)
     if min_batches == 1 and resolved_workers > 1 and page_count >= resolved_min_pages:
-        batch_count = min(resolved_workers, page_count)
+        min_pages_per_split = max(2, resolved_min_pages // 2)
+        batch_count = min(resolved_workers, max(1, page_count // min_pages_per_split))
     else:
         batch_count = min(min_batches, page_count)
 

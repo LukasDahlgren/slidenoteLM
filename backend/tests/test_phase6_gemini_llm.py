@@ -738,7 +738,10 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
 
     def test_generate_notes_uses_high_medium_schemas_reuses_client_and_degrades_audit_gracefully(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            settings = _make_settings(Path(tmp), pipeline_llm_mode="gemini", llm_retry_attempts=2)
+            settings = _make_settings(
+                Path(tmp), llm_retry_attempts=2, llm_notes_parallel_workers=1,
+                notes_min_audit_transcript_chars=0,
+            )
             slides = _sample_slides()
             transcript = _sample_transcript()
             alignment = AlignmentArtifact(

@@ -509,6 +509,7 @@ def call_gemini_text(
     rate_limiter: OutboundRateLimiter | None = None,
     progress_callback: ProgressCallback | None = None,
     sleep_fn: SleepFn = time.sleep,
+    cancel_event: threading.Event | None = None,
 ) -> GeminiTextResult:
     """Call Google Gemini generate_content with Gemini 4 thinking_level, pacing, and retries."""
     validate_gemini_credentials(settings, stage=stage)
@@ -580,8 +581,27 @@ def call_gemini_text(
     else:
         resolved_limiter = _get_global_llm_rate_limiter(rate_limit_rpm)
 
+    def _raise_if_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StageError(
+                stage=stage,
+                message=f"Cancelled {task_label} because another section failed.",
+                hint="Inspect the primary section error and retry.",
+            )
+
+    def _effective_sleep(seconds: float) -> None:
+        _raise_if_cancelled()
+        if seconds <= 0:
+            return
+        if cancel_event is not None and sleep_fn is time.sleep:
+            cancel_event.wait(timeout=seconds)
+        else:
+            sleep_fn(seconds)
+        _raise_if_cancelled()
+
     try:
         for attempt in range(1, attempts + 1):
+            _raise_if_cancelled()
             try:
                 if resolved_limiter is not None:
                     def _notify_wait(wait_seconds: float) -> None:
@@ -592,9 +612,11 @@ def call_gemini_text(
                         if progress_callback is not None:
                             progress_callback(wait_msg)
 
-                    resolved_limiter.acquire(sleep_fn=sleep_fn, on_wait=_notify_wait)
+                    resolved_limiter.acquire(sleep_fn=_effective_sleep, on_wait=_notify_wait)
 
+                _raise_if_cancelled()
                 with semaphore:
+                    _raise_if_cancelled()
                     response = client.models.generate_content(
                         model=resolved_model,
                         contents=user_prompt,
@@ -679,7 +701,7 @@ def call_gemini_text(
                 if progress_callback is not None:
                     progress_callback(retry_msg)
                 if delay > 0:
-                    sleep_fn(delay)
+                    _effective_sleep(delay)
 
         raise AssertionError("Unreachable retry loop exit.")  # pragma: no cover
     finally:

@@ -3,13 +3,23 @@ from __future__ import annotations
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any, Callable, Sequence
 
 from pydantic import ValidationError
 
 from ..config import (
+    DEFAULT_LLM_NOTES_PARALLEL_WORKERS,
+    DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS,
+    DEFAULT_NOTES_MAX_SLIDES_PER_SECTION,
+    DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS,
+    DEFAULT_NOTES_MAX_SECTION_TRANSCRIPT_CHARS,
+    DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_SECONDS,
+    DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_CHARS,
+    DEFAULT_NOTES_MIN_AUDIT_TRANSCRIPT_CHARS,
     DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS,
     DEFAULT_LLM_COVERAGE_MODEL,
     DEFAULT_LLM_COVERAGE_THINKING_LEVEL,
@@ -61,9 +71,11 @@ from .prompts import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MAX_SLIDES_PER_SECTION = 4
-DEFAULT_MAX_SECTION_DURATION_SECONDS = 480.0
-DEFAULT_MAX_SECTION_TRANSCRIPT_CHARS = 6000
+DEFAULT_MAX_SLIDES_PER_SECTION = DEFAULT_NOTES_MAX_SLIDES_PER_SECTION
+DEFAULT_MAX_SECTION_DURATION_SECONDS = DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS
+DEFAULT_MAX_SECTION_TRANSCRIPT_CHARS = DEFAULT_NOTES_MAX_SECTION_TRANSCRIPT_CHARS
+DEFAULT_INLINE_OFF_SLIDE_MAX_SECONDS = DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_SECONDS
+DEFAULT_INLINE_OFF_SLIDE_MAX_CHARS = DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_CHARS
 
 SectionNotesLLMCallable = Callable[[PromptMessages, SectionPromptInput, Settings], str]
 CoverageCheckLLMCallable = Callable[
@@ -215,7 +227,12 @@ class SectionChunkConfig:
     max_duration_seconds: float = DEFAULT_MAX_SECTION_DURATION_SECONDS
     max_transcript_chars: int = DEFAULT_MAX_SECTION_TRANSCRIPT_CHARS
 
+    inline_off_slide_max_seconds: float = DEFAULT_INLINE_OFF_SLIDE_MAX_SECONDS
+    inline_off_slide_max_chars: int = DEFAULT_INLINE_OFF_SLIDE_MAX_CHARS
+
     def __post_init__(self) -> None:
+        if self.inline_off_slide_max_seconds < 0 or self.inline_off_slide_max_chars < 0:
+            raise ValueError("inline off-slide limits must be nonnegative")
         if self.max_slides_per_section < 1:
             raise ValueError("max_slides_per_section must be >= 1")
         if self.max_duration_seconds <= 0:
@@ -654,23 +671,51 @@ def build_lecture_sections(
 
     # Group contiguous spans of the same kind into LectureSection chunks.
     raw_groups: list[list[_ResolvedSpan]] = []
-    for span in resolved_spans:
+    pos = 0
+    while pos < len(resolved_spans):
+        span = resolved_spans[pos]
         if not raw_groups:
             raw_groups.append([span])
+            pos += 1
             continue
 
         current_group = raw_groups[-1]
         current_kind = current_group[0].kind
-        if span.kind != current_kind:
-            raw_groups.append([span])
-            continue
 
         group_start = current_group[0].start_time
+        current_chars = sum(item.transcript_chars for item in current_group)
         projected_duration = max(0.0, span.end_time - group_start)
-        projected_chars = sum(item.transcript_chars for item in current_group) + span.transcript_chars
+        projected_chars = current_chars + span.transcript_chars
 
         exceeds_duration = projected_duration > chunk_cfg.max_duration_seconds
         exceeds_chars = projected_chars > chunk_cfg.max_transcript_chars
+        if span.kind != current_kind:
+            if span.kind == "off_slide" and current_kind == "aligned":
+                run_end = pos
+                while run_end < len(resolved_spans) and resolved_spans[run_end].kind == "off_slide":
+                    run_end += 1
+                run = resolved_spans[pos:run_end]
+                flanked_by_aligned = (
+                    run_end < len(resolved_spans) and resolved_spans[run_end].kind == "aligned"
+                )
+                run_duration = max(0.0, run[-1].end_time - run[0].start_time)
+                run_chars = sum(item.transcript_chars for item in run)
+                run_projected_duration = max(0.0, run[-1].end_time - group_start)
+                run_projected_chars = current_chars + run_chars
+                if (
+                    flanked_by_aligned
+                    and run_duration <= chunk_cfg.inline_off_slide_max_seconds
+                    and run_chars <= chunk_cfg.inline_off_slide_max_chars
+                    and run_projected_duration <= chunk_cfg.max_duration_seconds
+                    and run_projected_chars <= chunk_cfg.max_transcript_chars
+                ):
+                    current_group.extend(run)
+                    pos = run_end
+                    continue
+            raw_groups.append([span])
+            pos += 1
+            continue
+
         exceeds_slides = False
         if current_kind == "aligned":
             unique_slides = {item.slide for item in current_group if item.slide is not None}
@@ -682,6 +727,7 @@ def build_lecture_sections(
             raw_groups.append([span])
         else:
             current_group.append(span)
+        pos += 1
 
     total_sections = len(raw_groups)
     sections: list[LectureSection] = []
@@ -934,8 +980,31 @@ def render_section_notes_stub(prompt_input: SectionPromptInput) -> str:
             else:
                 unassigned_segments.append(seg)
 
+        pending_off_slide = sorted(unassigned_segments, key=lambda s: (s.start, s.index))
+
+        def _flush_off_slide_before(cutoff_time: float | None) -> None:
+            nonlocal pending_off_slide
+            if not pending_off_slide:
+                return
+            if cutoff_time is None:
+                to_emit = pending_off_slide
+                pending_off_slide = []
+            else:
+                to_emit = [seg for seg in pending_off_slide if seg.start <= cutoff_time]
+                pending_off_slide = [seg for seg in pending_off_slide if seg.start > cutoff_time]
+            if not to_emit:
+                return
+            lines.append("**Off-Slide Addition (Timestamped):**")
+            for seg in to_emit:
+                seg_range = format_timestamp_range(seg.start, seg.end)
+                lines.append(f"- {seg_range} [Off-slide] {seg.text.strip()}")
+            lines.append("")
+
         for slide in prompt_input.slides:
             slide_segs = segments_by_slide.get(slide.slide, [])
+            if slide_segs:
+                _flush_off_slide_before(slide_segs[0].start)
+
             slide_title = _slide_heading_from_ocr(slide)
             slide_ts = (
                 f" {format_timestamp_range(slide_segs[0].start, slide_segs[-1].end)}"
@@ -969,12 +1038,7 @@ def render_section_notes_stub(prompt_input: SectionPromptInput) -> str:
                     lines.append(f"- {seg_range} {seg.text.strip()}")
                 lines.append("")
 
-        if unassigned_segments:
-            lines.append("**Additional Spoken Explanation (Timestamped):**")
-            for seg in unassigned_segments:
-                seg_range = format_timestamp_range(seg.start, seg.end)
-                lines.append(f"- {seg_range} {seg.text.strip()}")
-            lines.append("")
+        _flush_off_slide_before(None)
 
     elif prompt_input.section_kind == "off_slide":
         lines.append(
@@ -1124,6 +1188,7 @@ def _generate_section_notes_with_usage(
     client: Any | None = None,
     client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> tuple[str, GeminiTextResult | None]:
     prompt_messages = build_section_notes_prompt(prompt_input)
 
@@ -1186,6 +1251,7 @@ def _generate_section_notes_with_usage(
             client=client,
             client_factory=client_factory,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
         cleaned = _unwrap_outer_markdown_fence(result.text)
         if not cleaned:
@@ -1242,6 +1308,7 @@ def _check_coverage_with_usage(
     client: Any | None = None,
     client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> tuple[CoverageCheckResult, GeminiTextResult | None]:
     prompt_messages = build_coverage_check_prompt(coverage_input)
 
@@ -1322,6 +1389,7 @@ def _check_coverage_with_usage(
             client=client,
             client_factory=client_factory,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
         return result.parsed, result
 
@@ -1495,6 +1563,50 @@ def _assemble_document_markdown(
     return "\n\n---\n\n".join(blocks).rstrip() + "\n"
 
 
+def _make_section_prompt(
+    section: LectureSection,
+    lecture_title: str,
+    rolling_context: RollingContext,
+    outline: tuple[str, ...] = (),
+    boundary: tuple[SectionPromptSegment, ...] = (),
+) -> SectionPromptInput:
+    return SectionPromptInput(
+        lecture_title=lecture_title,
+        section_index=section.section_index,
+        total_sections=section.total_sections,
+        section_kind=section.kind,
+        start_time=section.start_time,
+        end_time=section.end_time,
+        slide_numbers=section.slide_numbers,
+        slides=section.slides,
+        segments=section.segments,
+        rolling_context=rolling_context.snapshot(),
+        alignment_warnings=section.alignment_warnings,
+        lecture_outline=outline,
+        prior_boundary_segments=boundary,
+        uncertainty_reasons=section.uncertainty_reasons,
+    )
+
+
+def _build_parallel_prompt_inputs(
+    sections: Sequence[LectureSection], lecture_title: str, slides_ocr: SlidesOCRArtifact
+) -> list[SectionPromptInput]:
+    outline = tuple(
+        f"Slide {slide.slide}: {_slide_heading_from_ocr(_to_prompt_slide(slide))}"
+        for slide in sorted(slides_ocr.slides, key=lambda slide: slide.slide)
+    )
+    context = RollingContext()
+    boundary: tuple[SectionPromptSegment, ...] = ()
+    prompts = []
+    for section in sections:
+        section_outline = outline if section.kind == "aligned" else ()
+        prompt = _make_section_prompt(section, lecture_title, context, section_outline, boundary)
+        prompts.append(prompt)
+        update_rolling_context(context, section, "## " + _section_topic_title(prompt))
+        boundary = tuple(sorted((*boundary, *section.segments), key=lambda seg: (seg.start, seg.index))[-4:])
+    return prompts
+
+
 def generate_notes(
     slides_ocr: SlidesOCRArtifact,
     transcript: TranscriptArtifact,
@@ -1573,112 +1685,144 @@ def generate_notes(
             slides_ocr,
             transcript,
             alignment,
-            config=chunk_config,
+            config=chunk_config or SectionChunkConfig(
+                max_slides_per_section=settings.notes_max_slides_per_section,
+                max_duration_seconds=settings.notes_max_section_duration_seconds,
+                max_transcript_chars=settings.notes_max_section_transcript_chars,
+                inline_off_slide_max_seconds=settings.notes_inline_off_slide_max_seconds,
+                inline_off_slide_max_chars=settings.notes_inline_off_slide_max_chars,
+            ),
         )
 
         total_sections = len(sections)
-        for section in sections:
-            if progress_callback is not None:
-                progress_callback(
-                    f"Generating notes for section {section.section_index} of {total_sections}..."
-                )
+        notes_workers = getattr(settings, "llm_notes_parallel_workers", DEFAULT_LLM_NOTES_PARALLEL_WORKERS)
+        coverage_workers = getattr(settings, "llm_coverage_parallel_workers", DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS)
+        min_audit_chars = getattr(settings, "notes_min_audit_transcript_chars", DEFAULT_NOTES_MIN_AUDIT_TRANSCRIPT_CHARS)
+        parallel = (
+            use_gemini
+            and section_llm_callable is None
+            and coverage_llm_callable is None
+            and notes_workers > 1
+            and total_sections > 1
+        )
+        cancel_event = Event()
 
-            context_snapshot = rolling_context.snapshot()
-            prompt_input = SectionPromptInput(
+        def generate(prompt: SectionPromptInput):
+            return _generate_section_notes_with_usage(
+                prompt, settings, llm_callable=section_llm_callable, client=shared_client,
+                client_factory=client_factory, progress_callback=report, cancel_event=cancel_event,
+            )
+
+        callback_lock = Lock()
+
+        def report(message: str) -> None:
+            if progress_callback:
+                with callback_lock:
+                    progress_callback(message)
+
+        def should_skip_short_llm_audit(section: LectureSection) -> bool:
+            return use_gemini and coverage_llm_callable is None and section.transcript_chars < min_audit_chars
+
+        def audit(section: LectureSection, section_md: str):
+            coverage_input = CoverageCheckInput(
                 lecture_title=resolved_title,
                 section_index=section.section_index,
                 total_sections=section.total_sections,
                 section_kind=section.kind,
                 start_time=section.start_time,
                 end_time=section.end_time,
-                slide_numbers=section.slide_numbers,
-                slides=section.slides,
                 segments=section.segments,
-                rolling_context=context_snapshot,
-                alignment_warnings=section.alignment_warnings,
-                uncertainty_reasons=section.uncertainty_reasons,
+                generated_markdown=section_md,
+                slide_numbers=section.slide_numbers,
             )
-            prompt_inputs.append(prompt_input)
-
-            section_md, notes_usage = _generate_section_notes_with_usage(
-                prompt_input,
-                settings,
-                llm_callable=section_llm_callable,
-                client=shared_client,
-                client_factory=client_factory,
-                progress_callback=progress_callback,
-            )
-            section_markdowns.append(section_md)
-            if notes_usage is not None:
-                notes_input_tokens += notes_usage.input_tokens
-                notes_output_tokens += notes_usage.output_tokens
-                notes_thinking_tokens += notes_usage.thinking_tokens
-
-            if section.kind == "aligned":
-                aligned_slide_numbers.update(section.slide_numbers)
-
-            if section.segments:
-                if progress_callback is not None and use_gemini and coverage_llm_callable is None:
-                    progress_callback(
-                        f"Auditing transcript coverage for section {section.section_index} of "
-                        f"{total_sections}..."
-                    )
-                coverage_input = CoverageCheckInput(
-                    lecture_title=resolved_title,
-                    section_index=section.section_index,
-                    total_sections=section.total_sections,
-                    section_kind=section.kind,
-                    start_time=section.start_time,
-                    end_time=section.end_time,
-                    segments=section.segments,
-                    generated_markdown=section_md,
-                    slide_numbers=section.slide_numbers,
+            if use_gemini and coverage_llm_callable is None:
+                report(f"Auditing transcript coverage for section {section.section_index} of {total_sections}...")
+            try:
+                result, usage = _check_coverage_with_usage(
+                    coverage_input, settings, llm_callable=coverage_llm_callable, client=shared_client,
+                    client_factory=client_factory, progress_callback=report, cancel_event=cancel_event,
                 )
-                if use_gemini and coverage_llm_callable is None:
-                    try:
-                        cov_result, cov_usage = _check_coverage_with_usage(
-                            coverage_input,
-                            settings,
-                            llm_callable=coverage_llm_callable,
-                            client=shared_client,
-                            client_factory=client_factory,
-                            progress_callback=progress_callback,
-                        )
-                        if cov_usage is not None:
-                            coverage_input_tokens += cov_usage.input_tokens
-                            coverage_output_tokens += cov_usage.output_tokens
-                            coverage_thinking_tokens += cov_usage.thinking_tokens
-                    except StageError as exc:
-                        unavailable_note = (
-                            f"Coverage audit unavailable on section {section.section_index}: "
-                            f"{exc.message}"
-                        )
-                        logger.warning("%s", unavailable_note)
-                        cov_result = CoverageCheckResult(
-                            passed=False,
-                            checked_sections=1,
-                            covered_segment_count=0,
-                            total_segment_count=len(section.segments),
-                            missing_items=(),
-                            notes=unavailable_note,
-                        )
-                        coverage_warnings.append(unavailable_note)
-                else:
-                    cov_result, cov_usage = _check_coverage_with_usage(
-                        coverage_input,
-                        settings,
-                        llm_callable=coverage_llm_callable,
-                        client=shared_client,
-                        client_factory=client_factory,
-                        progress_callback=progress_callback,
-                    )
-                    if cov_usage is not None:
-                        coverage_input_tokens += cov_usage.input_tokens
-                        coverage_output_tokens += cov_usage.output_tokens
-                        coverage_thinking_tokens += cov_usage.thinking_tokens
-                coverage_results.append(cov_result)
+                return result, usage, ""
+            except StageError as exc:
+                if not use_gemini or coverage_llm_callable is not None:
+                    raise
+                warning = f"Coverage audit unavailable on section {section.section_index}: {exc.message}"
+                logger.warning("%s", warning)
+                result = CoverageCheckResult(
+                    passed=False,
+                    checked_sections=1,
+                    covered_segment_count=0,
+                    total_segment_count=len(section.segments),
+                    missing_items=(),
+                    notes=warning,
+                )
+                return result, None, warning
 
-            update_rolling_context(rolling_context, section, section_md)
+        notes = {}
+        audits = {}
+        skipped_short_audits = 0
+        if parallel:
+            prompt_inputs = _build_parallel_prompt_inputs(sections, resolved_title, slides_ocr)
+            with (
+                ThreadPoolExecutor(max_workers=min(notes_workers, total_sections)) as writers,
+                ThreadPoolExecutor(max_workers=min(coverage_workers, total_sections)) as reviewers,
+            ):
+                drafts = {writers.submit(generate, p): section for p, section in zip(prompt_inputs, sections)}
+                reviews = {}
+                try:
+                    for future in as_completed(drafts):
+                        section = drafts[future]
+                        idx = section.section_index
+                        notes[idx] = future.result()
+                        report(f"Generated notes for {len(notes)}/{total_sections} sections...")
+                        if section.segments:
+                            if should_skip_short_llm_audit(section):
+                                skipped_short_audits += 1
+                            else:
+                                reviews[reviewers.submit(audit, section, notes[idx][0])] = idx
+                    audit_count = len(reviews)
+                    for future in as_completed(reviews):
+                        audits[reviews[future]] = future.result()
+                        report(f"Audited transcript coverage for {len(audits)}/{audit_count} sections...")
+                except BaseException:
+                    cancel_event.set()
+                    for future in (*drafts, *reviews):
+                        future.cancel()
+                    raise
+        else:
+            for section in sections:
+                idx = section.section_index
+                report(f"Generating notes for section {idx} of {total_sections}...")
+                prompt = _make_section_prompt(section, resolved_title, rolling_context)
+                prompt_inputs.append(prompt)
+                notes[idx] = generate(prompt)
+                markdown = notes[idx][0]
+                if section.segments:
+                    if should_skip_short_llm_audit(section):
+                        skipped_short_audits += 1
+                    else:
+                        audits[idx] = audit(section, markdown)
+                update_rolling_context(rolling_context, section, markdown)
+
+        # Workers return usage with their results. Only the coordinator mutates totals.
+        for section in sections:
+            idx = section.section_index
+            markdown, usage = notes[idx]
+            section_markdowns.append(markdown)
+            aligned_slide_numbers.update(section.slide_numbers)
+            if usage:
+                notes_input_tokens += usage.input_tokens
+                notes_output_tokens += usage.output_tokens
+                notes_thinking_tokens += usage.thinking_tokens
+            if idx in audits:
+                result, usage, warning = audits[idx]
+                coverage_results.append(result)
+                if warning:
+                    coverage_warnings.append(warning)
+                if usage:
+                    coverage_input_tokens += usage.input_tokens
+                    coverage_output_tokens += usage.output_tokens
+                    coverage_thinking_tokens += usage.thinking_tokens
     finally:
         if owns_client:
             close_gemini_client(shared_client)
@@ -1687,6 +1831,23 @@ def generate_notes(
         progress_callback("Assembling final NotebookLM-ready Markdown document...")
 
     merged_coverage = _merge_coverage_results(coverage_results)
+    if skipped_short_audits > 0:
+        skip_note = (
+            f"Skipped LLM coverage audit on {skipped_short_audits} short section(s) "
+            f"(< {min_audit_chars} chars; unaudited)."
+        )
+        merged_coverage = CoverageCheckResult(
+            passed=merged_coverage.passed,
+            checked_sections=merged_coverage.checked_sections,
+            covered_segment_count=merged_coverage.covered_segment_count,
+            total_segment_count=merged_coverage.total_segment_count,
+            missing_items=merged_coverage.missing_items,
+            notes=(
+                f"{merged_coverage.notes} {skip_note}".strip()
+                if coverage_results
+                else skip_note
+            ),
+        )
     uncovered_slides_md = _render_uncovered_slides_section(
         slides_ocr,
         alignment,

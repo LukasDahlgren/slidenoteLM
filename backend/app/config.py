@@ -50,9 +50,9 @@ DEFAULT_OCR_MODEL_GOOGLE = DEFAULT_GEMINI_MODEL
 DEFAULT_OCR_THINKING_LEVEL = "LOW"
 DEFAULT_OCR_MAX_PAGES_PER_BATCH = 20
 DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # 18 MiB (safely below Gemini's 20 MB inline limit)
-DEFAULT_OCR_PARALLEL_WORKERS = 2
+DEFAULT_OCR_PARALLEL_WORKERS = 4
 DEFAULT_OCR_PARALLEL_MIN_PAGES = 4
-DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 4
+DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 6
 DEFAULT_OCR_RATE_LIMIT_RPM = 20
 DEFAULT_OCR_RETRY_ATTEMPTS = 3
 DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS = 2.0
@@ -66,14 +66,22 @@ DEFAULT_LLM_ALIGN_THINKING_LEVEL = "HIGH"
 DEFAULT_LLM_ALIGN_MAX_OUTPUT_TOKENS = 32768
 DEFAULT_LLM_NOTES_MODEL = DEFAULT_GEMINI_MODEL
 DEFAULT_LLM_NOTES_THINKING_LEVEL = "HIGH"
-DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS = 32768
+DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS = 49152
 DEFAULT_LLM_COVERAGE_MODEL = DEFAULT_GEMINI_MODEL
 DEFAULT_LLM_COVERAGE_THINKING_LEVEL = "MEDIUM"
 DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS = 16384
-DEFAULT_LLM_GLOBAL_MAX_CONCURRENT = 4
-DEFAULT_LLM_RATE_LIMIT_RPM = 20
+DEFAULT_LLM_GLOBAL_MAX_CONCURRENT = 8
+DEFAULT_LLM_RATE_LIMIT_RPM = 30
 DEFAULT_LLM_RETRY_ATTEMPTS = 4
 DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS = 2.0
+DEFAULT_LLM_NOTES_PARALLEL_WORKERS = 4
+DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS = 4
+DEFAULT_NOTES_MAX_SLIDES_PER_SECTION = 8
+DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS = 900.0
+DEFAULT_NOTES_MAX_SECTION_TRANSCRIPT_CHARS = 14000
+DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_SECONDS = 35.0
+DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_CHARS = 300
+DEFAULT_NOTES_MIN_AUDIT_TRANSCRIPT_CHARS = 200
 DEFAULT_LLM_TIMEOUT_SECONDS = 300.0
 
 VALID_THINKING_LEVELS: frozenset[str] = frozenset(
@@ -251,6 +259,15 @@ class Settings:
     rate_limit_health_per_window: int = DEFAULT_RATE_LIMIT_HEALTH_PER_WINDOW
     rate_limit_default_per_window: int = DEFAULT_RATE_LIMIT_DEFAULT_PER_WINDOW
 
+    llm_notes_parallel_workers: int = DEFAULT_LLM_NOTES_PARALLEL_WORKERS
+    llm_coverage_parallel_workers: int = DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS
+    notes_max_slides_per_section: int = DEFAULT_NOTES_MAX_SLIDES_PER_SECTION
+    notes_max_section_duration_seconds: float = DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS
+    notes_max_section_transcript_chars: int = DEFAULT_NOTES_MAX_SECTION_TRANSCRIPT_CHARS
+    notes_inline_off_slide_max_seconds: float = DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_SECONDS
+    notes_inline_off_slide_max_chars: int = DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_CHARS
+    notes_min_audit_transcript_chars: int = DEFAULT_NOTES_MIN_AUDIT_TRANSCRIPT_CHARS
+
     @property
     def transcribe_safe_upload_bytes(self) -> int:
         headroom_pct = max(10, min(99, self.transcribe_chunk_headroom_pct))
@@ -347,6 +364,30 @@ def load_settings(
             "LLM_RETRY_BASE_DELAY_SECONDS",
             DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS,
             minimum=0.0,
+        ),
+        llm_notes_parallel_workers=_parse_int_env(
+            "LLM_NOTES_PARALLEL_WORKERS", DEFAULT_LLM_NOTES_PARALLEL_WORKERS, minimum=1
+        ),
+        llm_coverage_parallel_workers=_parse_int_env(
+            "LLM_COVERAGE_PARALLEL_WORKERS", DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS, minimum=1
+        ),
+        notes_max_slides_per_section=_parse_int_env(
+            "NOTES_MAX_SLIDES_PER_SECTION", DEFAULT_NOTES_MAX_SLIDES_PER_SECTION, minimum=1
+        ),
+        notes_max_section_duration_seconds=_parse_float_env(
+            "NOTES_MAX_SECTION_DURATION_SECONDS", DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS, minimum=30.0
+        ),
+        notes_max_section_transcript_chars=_parse_int_env(
+            "NOTES_MAX_SECTION_TRANSCRIPT_CHARS", DEFAULT_NOTES_MAX_SECTION_TRANSCRIPT_CHARS, minimum=500
+        ),
+        notes_inline_off_slide_max_seconds=_parse_float_env(
+            "NOTES_INLINE_OFF_SLIDE_MAX_SECONDS", DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_SECONDS, minimum=0.0
+        ),
+        notes_inline_off_slide_max_chars=_parse_int_env(
+            "NOTES_INLINE_OFF_SLIDE_MAX_CHARS", DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_CHARS, minimum=0
+        ),
+        notes_min_audit_transcript_chars=_parse_int_env(
+            "NOTES_MIN_AUDIT_TRANSCRIPT_CHARS", DEFAULT_NOTES_MIN_AUDIT_TRANSCRIPT_CHARS, minimum=0
         ),
         llm_timeout_seconds=_parse_float_env(
             "LLM_TIMEOUT_SECONDS",

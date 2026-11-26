@@ -116,7 +116,26 @@ All `/api/*` endpoints use a built-in per-IP sliding-window rate limiter (emitti
 - `POST /api/jobs`: `10/min` (`RATE_LIMIT_JOBS_CREATE_PER_MINUTE`)
 - `GET /api/jobs/*` (status, preview, download): `120/min` (`RATE_LIMIT_JOBS_READ_PER_MINUTE`)
 - `GET /api/health` & other `/api/*`: `120/min` (`RATE_LIMIT_HEALTH_PER_MINUTE`, `RATE_LIMIT_DEFAULT_PER_MINUTE`)
-- Outbound Groq / Gemini pacing: `20 RPM` each (`TRANSCRIBE_RATE_LIMIT_RPM`, `OCR_RATE_LIMIT_RPM`, and `LLM_RATE_LIMIT_RPM`, each paced independently)
+- Groq and OCR use independent 20 RPM limits. Slide alignment, notes and coverage share a 30 RPM limit.
+
+Gemini drafts up to four lecture sections at once. Each worker receives a slide outline and the previous four transcript segments for continuity. Coverage checks start as drafts finish, and the final document follows lecture order. Short off-slide remarks between slides stay in the surrounding section with their own timestamp. Sections under 200 transcript characters use a local coverage check.
+
+| Setting | Default |
+| --- | ---: |
+| `OCR_PARALLEL_WORKERS` | 4 |
+| `OCR_GLOBAL_MAX_CONCURRENT` | 6 |
+| `LLM_NOTES_MAX_OUTPUT_TOKENS` | 49152 |
+| `LLM_GLOBAL_MAX_CONCURRENT` | 8 |
+| `LLM_RATE_LIMIT_RPM` | 30 |
+| `LLM_NOTES_PARALLEL_WORKERS` | 4 |
+| `LLM_COVERAGE_PARALLEL_WORKERS` | 4 |
+| `NOTES_MAX_SLIDES_PER_SECTION` | 8 |
+| `NOTES_MAX_SECTION_DURATION_SECONDS` | 900.0 |
+| `NOTES_MAX_SECTION_TRANSCRIPT_CHARS` | 14000 |
+| `NOTES_INLINE_OFF_SLIDE_MAX_SECONDS` | 35.0 |
+| `NOTES_INLINE_OFF_SLIDE_MAX_CHARS` | 300 |
+| `NOTES_MIN_AUDIT_TRANSCRIPT_CHARS` | 200 |
+
 
 ## Status
 

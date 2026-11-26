@@ -661,7 +661,9 @@ class TestUncertaintyFallback(unittest.TestCase):
                 ),
             ],
         )
-        sections = build_lecture_sections(slides_ocr, transcript, alignment)
+        sections = build_lecture_sections(
+            slides_ocr, transcript, alignment, config=SectionChunkConfig(max_duration_seconds=480)
+        )
         # Confirmed slides 1 and 2 remain aligned; only the localized regressing entry is uncertain.
         self.assertEqual([sec.kind for sec in sections], ["aligned", "aligned", "uncertain"])
         self.assertEqual(sections[0].slide_numbers, (1,))

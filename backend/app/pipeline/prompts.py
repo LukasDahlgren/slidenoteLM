@@ -395,6 +395,8 @@ class SectionPromptInput:
     rolling_context: RollingContext = field(default_factory=RollingContext)
     alignment_warnings: tuple[str, ...] = ()
     uncertainty_reasons: tuple[str, ...] = ()
+    lecture_outline: tuple[str, ...] = ()
+    prior_boundary_segments: tuple[SectionPromptSegment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -500,8 +502,21 @@ def build_section_notes_prompt(payload: SectionPromptInput) -> PromptMessages:
             lines.append(f"- {warning}")
 
     lines.append("")
+    if payload.section_kind == "aligned" and payload.lecture_outline:
+        lines.append("### Full Lecture Slide Outline (Reference Map Only)")
+        lines.extend(f"- {heading}" for heading in payload.lecture_outline)
+        lines.append("")
     lines.append("### Rolling Context From Prior Sections")
     lines.append(payload.rolling_context.to_prompt_block())
+    if payload.prior_boundary_segments:
+        lines.extend(("", "### Immediate Prior Transcript Context (Read-Only Continuity Overlap — Do NOT Re-Document)"))
+        for seg in payload.prior_boundary_segments:
+            ts_label = format_timestamp_range(seg.start, seg.end)
+            if payload.section_kind != "aligned":
+                lines.append(f"- {ts_label}: {seg.text.strip()}")
+            else:
+                tag = "Uncertain" if seg.uncertain else (f"Slide {seg.slide}" if seg.slide is not None else "Off-slide")
+                lines.append(f"- {ts_label} [{tag}]: {seg.text.strip()}")
 
     if payload.section_kind == "aligned" and payload.slides:
         lines.append("")
@@ -537,6 +552,8 @@ def build_section_notes_prompt(payload: SectionPromptInput) -> PromptMessages:
                 if payload.section_kind == "aligned" and seg.slide is not None and not seg.uncertain
                 else ""
             )
+            if payload.section_kind == "aligned" and seg.slide is None and not seg.uncertain:
+                slide_tag = " [Off-slide]"
             lines.append(f"- {seg_range} (seg {seg.index}){slide_tag}: {seg.text.strip()}")
     else:
         lines.append("(No spoken transcript segments aligned to this section.)")
