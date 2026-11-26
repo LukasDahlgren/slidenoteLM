@@ -8,7 +8,12 @@ from typing import Any, Callable, Sequence
 
 from pydantic import ValidationError
 
-from ..config import Settings
+from ..config import (
+    DEFAULT_LLM_ALIGN_MAX_OUTPUT_TOKENS,
+    DEFAULT_LLM_ALIGN_MODEL,
+    DEFAULT_LLM_ALIGN_THINKING_LEVEL,
+    Settings,
+)
 from ..schemas import (
     ARTIFACT_ALIGNMENT,
     AlignmentArtifact,
@@ -22,6 +27,12 @@ from ..schemas import (
     StageError,
     StageResult,
     TranscriptArtifact,
+)
+from .gemini_client import GenAIClientFactory, call_gemini_text, is_gemini_live_mode
+from .prompts import (
+    ALIGNMENT_RESPONSE_JSON_SCHEMA,
+    build_alignment_prompt,
+    parse_alignment_response,
 )
 
 STAGE_NAME: PipelineStage = "alignment"
@@ -140,6 +151,21 @@ def _tokenize_content(text: str) -> set[str]:
     }
 
 
+def _parse_bool_flag(value: Any) -> bool:
+    """Safely parse boolean flags from JSON-like values without treating 'false' as True."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        cleaned = value.strip().lower()
+        if cleaned in {"true", "1", "yes"}:
+            return True
+        if cleaned in {"false", "0", "no", ""}:
+            return False
+    return bool(value)
+
+
 def _append_reason(existing: str, addition: str) -> str:
     clean_existing = existing.strip()
     clean_addition = addition.strip()
@@ -244,7 +270,7 @@ def normalize_alignment_entries(
 
         raw_slide = item.get("slide", None)
         slide_val: int | None = None
-        uncertain = bool(item.get("uncertain", False))
+        uncertain = _parse_bool_flag(item.get("uncertain", False))
         reason = str(item.get("reason", "") or "").strip()
 
         if raw_slide is not None:
@@ -1026,20 +1052,99 @@ def align_deterministic_stub(
     return entries
 
 
+def _align_with_gemini(
+    slides: SlidesOCRArtifact,
+    transcript: TranscriptArtifact,
+    settings: Settings,
+    *,
+    client_factory: GenAIClientFactory | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[list[dict[str, Any]], tuple[int, int, int]]:
+    """Run live slide-to-transcript alignment using Google Gemini."""
+    if not transcript.segments:
+        return [], (0, 0, 0)
+
+    ordered_slides = _ordered_slides(slides)
+    if not ordered_slides:
+        return (
+            [
+                {
+                    "slide": None,
+                    "start_segment": 0,
+                    "end_segment": len(transcript.segments) - 1,
+                    "uncertain": False,
+                    "reason": "No slides available; treating full transcript as timestamp-only off-slide span.",
+                }
+            ],
+            (0, 0, 0),
+        )
+
+    model = (
+        str(getattr(settings, "llm_align_model", DEFAULT_LLM_ALIGN_MODEL) or "").strip()
+        or DEFAULT_LLM_ALIGN_MODEL
+    )
+    thinking_level = str(
+        getattr(settings, "llm_align_thinking_level", DEFAULT_LLM_ALIGN_THINKING_LEVEL) or ""
+    )
+    max_output_tokens = int(
+        getattr(settings, "llm_align_max_output_tokens", DEFAULT_LLM_ALIGN_MAX_OUTPUT_TOKENS)
+        or DEFAULT_LLM_ALIGN_MAX_OUTPUT_TOKENS
+    )
+
+    if progress_callback is not None:
+        level_suffix = f", thinking={thinking_level}" if thinking_level else ""
+        progress_callback(
+            f"Aligning {len(transcript.segments)} transcript segment(s) to "
+            f"{len(ordered_slides)} slide(s) with Gemini ({model}{level_suffix})..."
+        )
+
+    prompt_messages = build_alignment_prompt(slides, transcript)
+    result = call_gemini_text(
+        stage=STAGE_NAME,
+        task_label=f"alignment ({model})",
+        settings=settings,
+        model=model,
+        thinking_level=thinking_level,
+        system_instruction=prompt_messages.system,
+        user_prompt=prompt_messages.user,
+        max_output_tokens=max_output_tokens,
+        response_mime_type="application/json",
+        response_json_schema=ALIGNMENT_RESPONSE_JSON_SCHEMA,
+        parse_fn=parse_alignment_response,
+        client_factory=client_factory,
+        progress_callback=progress_callback,
+    )
+
+    parsed_entries = result.parsed
+    if parsed_entries is None:
+        try:
+            parsed_entries = parse_alignment_response(result.text)
+        except ValueError as exc:
+            raise StageError(
+                stage=STAGE_NAME,
+                message=f"Invalid alignment JSON returned by Gemini ({model}): {exc}",
+                hint=(
+                    "Retry the job or switch PIPELINE_LLM_MODE=stub to run deterministic local "
+                    "alignment while investigating the malformed JSON response."
+                ),
+            ) from exc
+
+    usage_tokens = (result.input_tokens, result.output_tokens, result.thinking_tokens)
+    return parsed_entries, usage_tokens
+
+
 def align_with_llm(
     slides: SlidesOCRArtifact,
     transcript: TranscriptArtifact,
     settings: Settings,
     *,
     llm_callable: AlignmentLLMCallable | None = None,
+    client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
+    usage_out: dict[str, int] | None = None,
 ) -> AlignmentArtifact:
-    """Align transcript segments to slides via injected LLM callable or deterministic stub mode.
-
-    When PIPELINE_LLM_MODE != 'stub' and no llm_callable is wired, raises an actionable
-    StageError noting that Phase 6 wires the chosen LLM provider.
-    """
-    mode = (settings.pipeline_llm_mode or "stub").strip().lower() or "stub"
+    """Align transcript segments to slides via Google Gemini, injected callable, or stub mode."""
+    mode = (settings.pipeline_llm_mode or "gemini").strip().lower() or "gemini"
 
     if llm_callable is not None:
         if progress_callback is not None:
@@ -1095,13 +1200,41 @@ def align_with_llm(
             alignment_issues=all_issues,
         )
 
+    if is_gemini_live_mode(mode):
+        raw_entries, (input_tokens, output_tokens, thinking_tokens) = _align_with_gemini(
+            slides,
+            transcript,
+            settings,
+            client_factory=client_factory,
+            progress_callback=progress_callback,
+        )
+        if usage_out is not None:
+            usage_out["align_input_tokens"] = input_tokens
+            usage_out["align_output_tokens"] = output_tokens
+            usage_out["align_thinking_tokens"] = thinking_tokens
+        normalized_entries, parse_issues = normalize_alignment_entries(
+            raw_entries, transcript, slides
+        )
+        annotated_entries, all_issues = annotate_alignment_entries(
+            normalized_entries,
+            transcript,
+            slides,
+            extra_issues=parse_issues,
+        )
+        return AlignmentArtifact(
+            mode="gemini",
+            entries=annotated_entries,
+            alignment_issues=all_issues,
+        )
+
     raise StageError(
         stage=STAGE_NAME,
-        message=f"Alignment LLM mode '{settings.pipeline_llm_mode}' is not wired yet.",
+        message=f"Alignment LLM mode '{settings.pipeline_llm_mode}' is not supported.",
         hint=(
-            "Phase 6 will wire the chosen LLM provider into backend/app/pipeline/align.py "
-            "(align_with_llm). Set PIPELINE_LLM_MODE=stub in .env to run the pipeline "
-            "end-to-end using deterministic stub alignment."
+            "Phase 6 wired Google Gemini as the single LLM provider in "
+            "backend/app/pipeline/align.py (align_with_llm). Set PIPELINE_LLM_MODE=gemini "
+            "(or PIPELINE_LLM_MODE=live) with GEMINI_API_KEY, or set PIPELINE_LLM_MODE=stub "
+            "in .env to run deterministic stub alignment."
         ),
     )
 
@@ -1111,18 +1244,22 @@ def run_alignment_stage(
     settings: Settings,
     *,
     llm_callable: AlignmentLLMCallable | None = None,
+    client_factory: GenAIClientFactory | None = None,
 ) -> StageResult:
     """Execute the alignment pipeline stage and persist artifacts/alignment.json."""
     context.report_progress("Loading transcript and slide OCR artifacts...")
     transcript = load_transcript_artifact(context.transcript_path)
     slides = load_slides_ocr_artifact(context.slides_ocr_path)
 
+    usage: dict[str, int] = {}
     artifact = align_with_llm(
         slides,
         transcript,
         settings,
         llm_callable=llm_callable,
+        client_factory=client_factory,
         progress_callback=context.report_progress,
+        usage_out=usage,
     )
 
     context.alignment_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1147,17 +1284,21 @@ def run_alignment_stage(
         summary += "."
     context.report_progress(summary)
 
+    stats: dict[str, Any] = {
+        "alignment_mode": artifact.mode,
+        "aligned_entries": len(artifact.entries),
+        "aligned_slides": aligned_slides,
+        "uncertain_entries": uncertain_entries,
+        "off_slide_entries": off_slide_entries,
+        "alignment_issue_count": len(artifact.alignment_issues),
+    }
+    if usage:
+        stats.update(usage)
+
     return StageResult(
         message=summary,
         artifacts={"alignment": ARTIFACT_ALIGNMENT},
-        stats={
-            "alignment_mode": artifact.mode,
-            "aligned_entries": len(artifact.entries),
-            "aligned_slides": aligned_slides,
-            "uncertain_entries": uncertain_entries,
-            "off_slide_entries": off_slide_entries,
-            "alignment_issue_count": len(artifact.alignment_issues),
-        },
+        stats=stats,
         warnings=warnings,
     )
 

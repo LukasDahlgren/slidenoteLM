@@ -9,7 +9,15 @@ from typing import Any, Callable, Sequence
 
 from pydantic import ValidationError
 
-from ..config import Settings
+from ..config import (
+    DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS,
+    DEFAULT_LLM_COVERAGE_MODEL,
+    DEFAULT_LLM_COVERAGE_THINKING_LEVEL,
+    DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS,
+    DEFAULT_LLM_NOTES_MODEL,
+    DEFAULT_LLM_NOTES_THINKING_LEVEL,
+    Settings,
+)
 from ..schemas import (
     ARTIFACT_NOTES_MD,
     AlignmentArtifact,
@@ -24,7 +32,17 @@ from ..schemas import (
     TranscriptArtifact,
     TranscriptSegment,
 )
+from .gemini_client import (
+    GeminiTextResult,
+    GenAIClientFactory,
+    call_gemini_text,
+    close_gemini_client,
+    create_gemini_client,
+    is_gemini_live_mode,
+    validate_gemini_credentials,
+)
 from .prompts import (
+    COVERAGE_CHECK_RESPONSE_JSON_SCHEMA,
     CoverageCheckInput,
     CoverageCheckResult,
     CoverageGap,
@@ -251,6 +269,12 @@ class NotesGenerationResult:
     coverage_result: CoverageCheckResult
     warnings: tuple[str, ...]
     word_count: int
+    notes_input_tokens: int = 0
+    notes_output_tokens: int = 0
+    notes_thinking_tokens: int = 0
+    coverage_input_tokens: int = 0
+    coverage_output_tokens: int = 0
+    coverage_thinking_tokens: int = 0
 
 
 def _load_json_artifact(
@@ -1059,13 +1083,48 @@ def check_section_coverage_stub(payload: CoverageCheckInput) -> CoverageCheckRes
     )
 
 
-def generate_section_notes_with_llm(
+def _unwrap_outer_markdown_fence(raw_text: str) -> str:
+    """Unwrap an outer ```markdown ... ``` fence if the LLM wrapped the entire section."""
+    cleaned = (raw_text or "").strip()
+    if not cleaned.startswith("```") or not cleaned.endswith("```"):
+        return cleaned
+    lines = cleaned.splitlines()
+    if len(lines) < 2:
+        return cleaned
+    opening = lines[0].strip()
+    closing = lines[-1].strip()
+    if not opening.startswith("```") or closing != "```":
+        return cleaned
+    language = opening[3:].strip().lower()
+    if language not in {"", "md", "markdown"}:
+        return cleaned
+
+    body_lines = lines[1:-1]
+    inner_fence_lines = sum(1 for line in body_lines if line.lstrip().startswith("```"))
+    body = "\n".join(body_lines).strip()
+
+    if language == "":
+        if inner_fence_lines > 0:
+            return cleaned
+        first_non_empty = next((line.lstrip() for line in body_lines if line.strip()), "")
+        if not first_non_empty.startswith("## "):
+            return cleaned
+        return body
+
+    if inner_fence_lines % 2 != 0:
+        return cleaned
+    return body
+
+
+def _generate_section_notes_with_usage(
     prompt_input: SectionPromptInput,
     settings: Settings,
     *,
     llm_callable: SectionNotesLLMCallable | None = None,
-) -> str:
-    """Phase 6 LLM hook for generating one section's NotebookLM-optimized Markdown notes."""
+    client: Any | None = None,
+    client_factory: GenAIClientFactory | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[str, GeminiTextResult | None]:
     prompt_messages = build_section_notes_prompt(prompt_input)
 
     if llm_callable is not None:
@@ -1083,7 +1142,7 @@ def generate_section_notes_with_llm(
                 hint="Check your LLM provider credentials, model configuration, and rate limits, then retry.",
             ) from exc
 
-        cleaned = (rendered or "").strip()
+        cleaned = _unwrap_outer_markdown_fence(rendered)
         if not cleaned:
             raise StageError(
                 stage="notes",
@@ -1093,33 +1152,97 @@ def generate_section_notes_with_llm(
                 ),
                 hint="Inspect the configured LLM provider response or retry with PIPELINE_LLM_MODE=stub.",
             )
-        return cleaned
+        return cleaned, None
 
-    mode = (settings.pipeline_llm_mode or "stub").strip().lower()
+    mode = (settings.pipeline_llm_mode or "gemini").strip().lower()
     if mode == "stub":
-        return render_section_notes_stub(prompt_input)
+        return render_section_notes_stub(prompt_input), None
+
+    if is_gemini_live_mode(mode):
+        model = (
+            str(getattr(settings, "llm_notes_model", DEFAULT_LLM_NOTES_MODEL) or "").strip()
+            or DEFAULT_LLM_NOTES_MODEL
+        )
+        thinking_level = str(
+            getattr(settings, "llm_notes_thinking_level", DEFAULT_LLM_NOTES_THINKING_LEVEL) or ""
+        )
+        max_output_tokens = int(
+            getattr(settings, "llm_notes_max_output_tokens", DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS)
+            or DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS
+        )
+        result = call_gemini_text(
+            stage="notes",
+            task_label=(
+                f"notes section {prompt_input.section_index}/{prompt_input.total_sections} "
+                f"({model})"
+            ),
+            settings=settings,
+            model=model,
+            thinking_level=thinking_level,
+            system_instruction=prompt_messages.system,
+            user_prompt=prompt_messages.user,
+            max_output_tokens=max_output_tokens,
+            response_mime_type=None,
+            client=client,
+            client_factory=client_factory,
+            progress_callback=progress_callback,
+        )
+        cleaned = _unwrap_outer_markdown_fence(result.text)
+        if not cleaned:
+            raise StageError(
+                stage="notes",
+                message=(
+                    f"Gemini ({model}) returned empty Markdown notes for section "
+                    f"{prompt_input.section_index}/{prompt_input.total_sections}."
+                ),
+                hint="Retry the job or test with PIPELINE_LLM_MODE=stub.",
+            )
+        return cleaned, result
 
     raise StageError(
         stage="notes",
         message=(
-            f"Markdown note generation LLM provider is not wired yet for "
-            f"PIPELINE_LLM_MODE='{settings.pipeline_llm_mode}'."
+            f"Markdown note generation LLM mode '{settings.pipeline_llm_mode}' is not supported."
         ),
         hint=(
-            "Phase 6 wires the chosen LLM provider into generate_section_notes_with_llm(). "
-            "Set PIPELINE_LLM_MODE=stub in .env to run deterministic Phase 4 scaffolding, "
+            "Phase 6 wired Google Gemini into generate_section_notes_with_llm(). "
+            "Set PIPELINE_LLM_MODE=gemini (or PIPELINE_LLM_MODE=live) with GEMINI_API_KEY, "
+            "set PIPELINE_LLM_MODE=stub in .env to run deterministic local scaffolding, "
             "or pass an explicit llm_callable."
         ),
     )
 
 
-def check_coverage_with_llm(
+def generate_section_notes_with_llm(
+    prompt_input: SectionPromptInput,
+    settings: Settings,
+    *,
+    llm_callable: SectionNotesLLMCallable | None = None,
+    client: Any | None = None,
+    client_factory: GenAIClientFactory | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> str:
+    """Generate one section's NotebookLM-optimized Markdown notes via Gemini, callable, or stub."""
+    markdown, _ = _generate_section_notes_with_usage(
+        prompt_input,
+        settings,
+        llm_callable=llm_callable,
+        client=client,
+        client_factory=client_factory,
+        progress_callback=progress_callback,
+    )
+    return markdown
+
+
+def _check_coverage_with_usage(
     coverage_input: CoverageCheckInput,
     settings: Settings,
     *,
     llm_callable: CoverageCheckLLMCallable | None = None,
-) -> CoverageCheckResult:
-    """Phase 6 LLM hook for auditing transcript coverage against generated section notes."""
+    client: Any | None = None,
+    client_factory: GenAIClientFactory | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> tuple[CoverageCheckResult, GeminiTextResult | None]:
     prompt_messages = build_coverage_check_prompt(coverage_input)
 
     if llm_callable is not None:
@@ -1138,11 +1261,14 @@ def check_coverage_with_llm(
             ) from exc
 
         if isinstance(raw_result, CoverageCheckResult):
-            return raw_result
+            return raw_result, None
         try:
-            return parse_coverage_check_response(
-                raw_result,
-                total_segment_count=len(coverage_input.segments),
+            return (
+                parse_coverage_check_response(
+                    raw_result,
+                    total_segment_count=len(coverage_input.segments),
+                ),
+                None,
             )
         except ValueError as exc:
             raise StageError(
@@ -1154,22 +1280,84 @@ def check_coverage_with_llm(
                 hint="Ensure the coverage-check LLM returns valid JSON matching the coverage schema.",
             ) from exc
 
-    mode = (settings.pipeline_llm_mode or "stub").strip().lower()
+    mode = (settings.pipeline_llm_mode or "gemini").strip().lower()
     if mode == "stub":
-        return check_section_coverage_stub(coverage_input)
+        return check_section_coverage_stub(coverage_input), None
+
+    if is_gemini_live_mode(mode):
+        model = (
+            str(getattr(settings, "llm_coverage_model", DEFAULT_LLM_COVERAGE_MODEL) or "").strip()
+            or DEFAULT_LLM_COVERAGE_MODEL
+        )
+        thinking_level = str(
+            getattr(settings, "llm_coverage_thinking_level", DEFAULT_LLM_COVERAGE_THINKING_LEVEL)
+            or ""
+        )
+        max_output_tokens = int(
+            getattr(
+                settings,
+                "llm_coverage_max_output_tokens",
+                DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS,
+            )
+            or DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS
+        )
+        result = call_gemini_text(
+            stage="notes",
+            task_label=(
+                f"coverage audit section {coverage_input.section_index}/"
+                f"{coverage_input.total_sections} ({model})"
+            ),
+            settings=settings,
+            model=model,
+            thinking_level=thinking_level,
+            system_instruction=prompt_messages.system,
+            user_prompt=prompt_messages.user,
+            max_output_tokens=max_output_tokens,
+            response_mime_type="application/json",
+            response_json_schema=COVERAGE_CHECK_RESPONSE_JSON_SCHEMA,
+            parse_fn=lambda txt: parse_coverage_check_response(
+                txt,
+                total_segment_count=len(coverage_input.segments),
+            ),
+            client=client,
+            client_factory=client_factory,
+            progress_callback=progress_callback,
+        )
+        return result.parsed, result
 
     raise StageError(
         stage="notes",
         message=(
-            f"Transcript coverage check LLM provider is not wired yet for "
-            f"PIPELINE_LLM_MODE='{settings.pipeline_llm_mode}'."
+            f"Transcript coverage check LLM mode '{settings.pipeline_llm_mode}' is not supported."
         ),
         hint=(
-            "Phase 6 wires the chosen LLM provider into check_coverage_with_llm(). "
-            "Set PIPELINE_LLM_MODE=stub in .env to run deterministic Phase 4 scaffolding, "
+            "Phase 6 wired Google Gemini into check_coverage_with_llm(). "
+            "Set PIPELINE_LLM_MODE=gemini (or PIPELINE_LLM_MODE=live) with GEMINI_API_KEY, "
+            "set PIPELINE_LLM_MODE=stub in .env to run deterministic local scaffolding, "
             "or pass an explicit llm_callable."
         ),
     )
+
+
+def check_coverage_with_llm(
+    coverage_input: CoverageCheckInput,
+    settings: Settings,
+    *,
+    llm_callable: CoverageCheckLLMCallable | None = None,
+    client: Any | None = None,
+    client_factory: GenAIClientFactory | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> CoverageCheckResult:
+    """Audit transcript coverage against generated section notes via Gemini, callable, or stub."""
+    cov_result, _ = _check_coverage_with_usage(
+        coverage_input,
+        settings,
+        llm_callable=llm_callable,
+        client=client,
+        client_factory=client_factory,
+        progress_callback=progress_callback,
+    )
+    return cov_result
 
 
 def _merge_coverage_results(results: Sequence[CoverageCheckResult]) -> CoverageCheckResult:
@@ -1317,97 +1505,183 @@ def generate_notes(
     chunk_config: SectionChunkConfig | None = None,
     section_llm_callable: SectionNotesLLMCallable | None = None,
     coverage_llm_callable: CoverageCheckLLMCallable | None = None,
+    client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> NotesGenerationResult:
     """Orchestrate section chunking, rolling context carry-over, LLM/stub generation, and coverage check."""
-    mode = (settings.pipeline_llm_mode or "stub").strip().lower()
-    if mode != "stub" and section_llm_callable is None:
+    mode = (settings.pipeline_llm_mode or "gemini").strip().lower()
+    use_gemini = is_gemini_live_mode(mode)
+
+    if mode != "stub" and not use_gemini and section_llm_callable is None:
         raise StageError(
             stage="notes",
             message=(
-                f"Markdown note generation LLM provider is not wired yet for "
-                f"PIPELINE_LLM_MODE='{settings.pipeline_llm_mode}'."
+                f"Markdown note generation LLM mode '{settings.pipeline_llm_mode}' is not supported."
             ),
             hint=(
-                "Phase 6 wires the chosen LLM provider into generate_section_notes_with_llm(). "
-                "Set PIPELINE_LLM_MODE=stub in .env to run deterministic Phase 4 scaffolding, "
+                "Phase 6 wired Google Gemini into generate_section_notes_with_llm(). "
+                "Set PIPELINE_LLM_MODE=gemini (or PIPELINE_LLM_MODE=live) with GEMINI_API_KEY, "
+                "set PIPELINE_LLM_MODE=stub in .env to run deterministic local scaffolding, "
                 "or pass an explicit section_llm_callable."
             ),
         )
 
-    resolved_title = (lecture_title or "").strip() or derive_lecture_title(slides_ocr)
-
-    if progress_callback is not None:
-        progress_callback("Chunking aligned slides and transcript into lecture sections...")
-
-    sections = build_lecture_sections(
-        slides_ocr,
-        transcript,
-        alignment,
-        config=chunk_config,
+    shared_client: Any | None = None
+    owns_client = False
+    needs_gemini_client = use_gemini and (
+        section_llm_callable is None or coverage_llm_callable is None
     )
+    if needs_gemini_client:
+        validate_gemini_credentials(settings, stage="notes")
+        factory = client_factory or create_gemini_client
+        try:
+            shared_client = factory(settings)
+            owns_client = client_factory is None
+        except StageError:
+            raise
+        except Exception as exc:
+            raise StageError(
+                stage="notes",
+                message=f"Failed to initialize Google Gemini client for notes stage: {exc}",
+                hint=(
+                    "Verify GEMINI_API_KEY (or Vertex AI config) in .env, restart the backend, "
+                    "and retry."
+                ),
+            ) from exc
+
+    resolved_title = (lecture_title or "").strip() or derive_lecture_title(slides_ocr)
 
     rolling_context = RollingContext()
     prompt_inputs: list[SectionPromptInput] = []
     section_markdowns: list[str] = []
     coverage_results: list[CoverageCheckResult] = []
+    coverage_warnings: list[str] = []
     aligned_slide_numbers: set[int] = set()
 
-    total_sections = len(sections)
-    for section in sections:
+    notes_input_tokens = 0
+    notes_output_tokens = 0
+    notes_thinking_tokens = 0
+    coverage_input_tokens = 0
+    coverage_output_tokens = 0
+    coverage_thinking_tokens = 0
+
+    try:
         if progress_callback is not None:
-            progress_callback(
-                f"Generating notes for section {section.section_index} of {total_sections}..."
-            )
+            progress_callback("Chunking aligned slides and transcript into lecture sections...")
 
-        context_snapshot = rolling_context.snapshot()
-        prompt_input = SectionPromptInput(
-            lecture_title=resolved_title,
-            section_index=section.section_index,
-            total_sections=section.total_sections,
-            section_kind=section.kind,
-            start_time=section.start_time,
-            end_time=section.end_time,
-            slide_numbers=section.slide_numbers,
-            slides=section.slides,
-            segments=section.segments,
-            rolling_context=context_snapshot,
-            alignment_warnings=section.alignment_warnings,
-            uncertainty_reasons=section.uncertainty_reasons,
+        sections = build_lecture_sections(
+            slides_ocr,
+            transcript,
+            alignment,
+            config=chunk_config,
         )
-        prompt_inputs.append(prompt_input)
 
-        section_md = generate_section_notes_with_llm(
-            prompt_input,
-            settings,
-            llm_callable=section_llm_callable,
-        )
-        section_markdowns.append(section_md)
+        total_sections = len(sections)
+        for section in sections:
+            if progress_callback is not None:
+                progress_callback(
+                    f"Generating notes for section {section.section_index} of {total_sections}..."
+                )
 
-        if section.kind == "aligned":
-            aligned_slide_numbers.update(section.slide_numbers)
-
-        if section.segments:
-            coverage_input = CoverageCheckInput(
+            context_snapshot = rolling_context.snapshot()
+            prompt_input = SectionPromptInput(
                 lecture_title=resolved_title,
                 section_index=section.section_index,
                 total_sections=section.total_sections,
                 section_kind=section.kind,
                 start_time=section.start_time,
                 end_time=section.end_time,
-                segments=section.segments,
-                generated_markdown=section_md,
                 slide_numbers=section.slide_numbers,
+                slides=section.slides,
+                segments=section.segments,
+                rolling_context=context_snapshot,
+                alignment_warnings=section.alignment_warnings,
+                uncertainty_reasons=section.uncertainty_reasons,
             )
-            coverage_results.append(
-                check_coverage_with_llm(
-                    coverage_input,
-                    settings,
-                    llm_callable=coverage_llm_callable,
-                )
-            )
+            prompt_inputs.append(prompt_input)
 
-        update_rolling_context(rolling_context, section, section_md)
+            section_md, notes_usage = _generate_section_notes_with_usage(
+                prompt_input,
+                settings,
+                llm_callable=section_llm_callable,
+                client=shared_client,
+                client_factory=client_factory,
+                progress_callback=progress_callback,
+            )
+            section_markdowns.append(section_md)
+            if notes_usage is not None:
+                notes_input_tokens += notes_usage.input_tokens
+                notes_output_tokens += notes_usage.output_tokens
+                notes_thinking_tokens += notes_usage.thinking_tokens
+
+            if section.kind == "aligned":
+                aligned_slide_numbers.update(section.slide_numbers)
+
+            if section.segments:
+                if progress_callback is not None and use_gemini and coverage_llm_callable is None:
+                    progress_callback(
+                        f"Auditing transcript coverage for section {section.section_index} of "
+                        f"{total_sections}..."
+                    )
+                coverage_input = CoverageCheckInput(
+                    lecture_title=resolved_title,
+                    section_index=section.section_index,
+                    total_sections=section.total_sections,
+                    section_kind=section.kind,
+                    start_time=section.start_time,
+                    end_time=section.end_time,
+                    segments=section.segments,
+                    generated_markdown=section_md,
+                    slide_numbers=section.slide_numbers,
+                )
+                if use_gemini and coverage_llm_callable is None:
+                    try:
+                        cov_result, cov_usage = _check_coverage_with_usage(
+                            coverage_input,
+                            settings,
+                            llm_callable=coverage_llm_callable,
+                            client=shared_client,
+                            client_factory=client_factory,
+                            progress_callback=progress_callback,
+                        )
+                        if cov_usage is not None:
+                            coverage_input_tokens += cov_usage.input_tokens
+                            coverage_output_tokens += cov_usage.output_tokens
+                            coverage_thinking_tokens += cov_usage.thinking_tokens
+                    except StageError as exc:
+                        unavailable_note = (
+                            f"Coverage audit unavailable on section {section.section_index}: "
+                            f"{exc.message}"
+                        )
+                        logger.warning("%s", unavailable_note)
+                        cov_result = CoverageCheckResult(
+                            passed=False,
+                            checked_sections=1,
+                            covered_segment_count=0,
+                            total_segment_count=len(section.segments),
+                            missing_items=(),
+                            notes=unavailable_note,
+                        )
+                        coverage_warnings.append(unavailable_note)
+                else:
+                    cov_result, cov_usage = _check_coverage_with_usage(
+                        coverage_input,
+                        settings,
+                        llm_callable=coverage_llm_callable,
+                        client=shared_client,
+                        client_factory=client_factory,
+                        progress_callback=progress_callback,
+                    )
+                    if cov_usage is not None:
+                        coverage_input_tokens += cov_usage.input_tokens
+                        coverage_output_tokens += cov_usage.output_tokens
+                        coverage_thinking_tokens += cov_usage.thinking_tokens
+                coverage_results.append(cov_result)
+
+            update_rolling_context(rolling_context, section, section_md)
+    finally:
+        if owns_client:
+            close_gemini_client(shared_client)
 
     if progress_callback is not None:
         progress_callback("Assembling final NotebookLM-ready Markdown document...")
@@ -1418,6 +1692,7 @@ def generate_notes(
         alignment,
         aligned_slide_numbers,
     )
+    resolved_mode = "gemini" if (use_gemini and section_llm_callable is None) else mode
     markdown = _assemble_document_markdown(
         lecture_title=resolved_title,
         slides_ocr=slides_ocr,
@@ -1425,7 +1700,7 @@ def generate_notes(
         alignment=alignment,
         section_markdowns=section_markdowns,
         uncovered_slides_markdown=uncovered_slides_md,
-        mode=(settings.pipeline_llm_mode or "stub").strip().lower(),
+        mode=resolved_mode,
     )
 
     warnings: list[str] = []
@@ -1434,6 +1709,9 @@ def generate_notes(
         if warning_text not in warnings:
             warnings.append(warning_text)
     for cov_warning in merged_coverage.to_warnings():
+        if cov_warning not in warnings:
+            warnings.append(cov_warning)
+    for cov_warning in coverage_warnings:
         if cov_warning not in warnings:
             warnings.append(cov_warning)
 
@@ -1445,10 +1723,21 @@ def generate_notes(
         coverage_result=merged_coverage,
         warnings=tuple(warnings),
         word_count=word_count,
+        notes_input_tokens=notes_input_tokens,
+        notes_output_tokens=notes_output_tokens,
+        notes_thinking_tokens=notes_thinking_tokens,
+        coverage_input_tokens=coverage_input_tokens,
+        coverage_output_tokens=coverage_output_tokens,
+        coverage_thinking_tokens=coverage_thinking_tokens,
     )
 
 
-def run_notes_stage(context: JobContext, settings: Settings) -> StageResult:
+def run_notes_stage(
+    context: JobContext,
+    settings: Settings,
+    *,
+    client_factory: GenAIClientFactory | None = None,
+) -> StageResult:
     """Pipeline stage handler: generate artifacts/notes.md from OCR, transcript, and alignment."""
     context.report_progress("Loading slide OCR, transcript, and alignment artifacts...")
     slides_ocr, transcript, alignment = load_notes_inputs(context)
@@ -1462,6 +1751,7 @@ def run_notes_stage(context: JobContext, settings: Settings) -> StageResult:
             slides_ocr,
             fallback_filename=context.slides_filename,
         ),
+        client_factory=client_factory,
         progress_callback=context.report_progress,
     )
 
@@ -1489,6 +1779,12 @@ def run_notes_stage(context: JobContext, settings: Settings) -> StageResult:
             "uncertain_sections": uncertain_count,
             "coverage_passed": result.coverage_result.passed,
             "coverage_gaps": len(result.coverage_result.missing_items),
+            "notes_input_tokens": result.notes_input_tokens,
+            "notes_output_tokens": result.notes_output_tokens,
+            "notes_thinking_tokens": result.notes_thinking_tokens,
+            "coverage_input_tokens": result.coverage_input_tokens,
+            "coverage_output_tokens": result.coverage_output_tokens,
+            "coverage_thinking_tokens": result.coverage_thinking_tokens,
         },
         warnings=list(result.warnings),
     )

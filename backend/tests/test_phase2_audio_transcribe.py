@@ -59,6 +59,7 @@ def _make_settings(tmp_dir: Path, **overrides: object) -> Settings:
         "data_dir": tmp_dir,
         "db_path": tmp_dir / "slidenotelm.db",
         "jobs_dir": tmp_dir / "jobs",
+        "pipeline_llm_mode": "stub",
         "groq_api_key": "gsk_test_key_123",
         "transcription_model": "whisper-large-v3-turbo",
         "transcribe_retry_attempts": 3,

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, Sequence
+
+from ..schemas import SlidesOCRArtifact, TranscriptArtifact
 
 SectionKind = Literal["aligned", "off_slide", "uncertain"]
 CoverageSeverity = Literal["warning", "error"]
@@ -130,6 +132,89 @@ def _render_spec_rules_block() -> str:
         for rule in AI_FIRST_MARKDOWN_RULES
     ]
     return "\n".join(lines)
+
+
+ALIGNMENT_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "entries": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "slide": {"type": ["integer", "null"]},
+                    "start_segment": {"type": "integer"},
+                    "end_segment": {"type": "integer"},
+                    "uncertain": {"type": "boolean"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["slide", "start_segment", "end_segment", "uncertain", "reason"],
+            },
+        }
+    },
+    "required": ["entries"],
+}
+
+COVERAGE_CHECK_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "passed": {"type": "boolean"},
+        "covered_segment_count": {"type": "integer"},
+        "total_segment_count": {"type": "integer"},
+        "missing_items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "category": {"type": "string"},
+                    "start_time": {"type": ["number", "null"]},
+                    "end_time": {"type": ["number", "null"]},
+                    "segment_indices": {"type": "array", "items": {"type": "integer"}},
+                    "summary": {"type": "string"},
+                    "severity": {"type": "string", "enum": ["warning", "error"]},
+                },
+                "required": ["category", "summary", "severity"],
+            },
+        },
+        "notes": {"type": "string"},
+    },
+    "required": ["passed", "covered_segment_count", "total_segment_count", "missing_items", "notes"],
+}
+
+ALIGNMENT_SYSTEM_PROMPT: str = (
+    "You are an expert lecture alignment engine. Your job is to align chronological spoken "
+    "transcript segments to the exact 1-indexed lecture slides the lecturer is actively "
+    "teaching or discussing.\n\n"
+    "Rules:\n"
+    "1. Cover EVERY transcript segment from index 0 through N-1 in strict chronological "
+    "order with contiguous, non-overlapping spans (each span has integer start_segment <= "
+    "end_segment, and the next span begins at previous end_segment + 1).\n"
+    "2. Assign each span to the exact 1-indexed slide number ('slide': <int>) matching the "
+    "lecturer's spoken explanation, using visible text, visual/diagram context, and "
+    "tables/code/formulas.\n"
+    "3. For substantive off-slide discussion (live coding/demos, whiteboard derivations not "
+    "on slides, extended tangents, student Q&A not tied to a slide, or lecture intro/outro "
+    "logistics), set \"slide\": null, \"uncertain\": false, and briefly describe the span "
+    "in \"reason\" (e.g. \"Live coding demo\" or \"Student Q&A on grading\").\n"
+    "4. If the lecturer genuinely jumps backward or skips ahead and the target slide is "
+    "clearly supported by the speech, assign that slide. Whenever the true slide is genuinely "
+    "ambiguous or unclear, set \"uncertain\": true and explain why in \"reason\" so "
+    "downstream note generation uses timestamp-only anchors instead of guessing.\n"
+    "5. Never invent slide numbers outside the provided deck. Slides skipped in speech "
+    "should simply not appear in any span.\n\n"
+    "Return ONLY valid JSON matching this exact schema:\n"
+    "{\n"
+    '  "entries": [\n'
+    "    {\n"
+    '      "slide": <int 1-indexed slide number or null>,\n'
+    '      "start_segment": <int>,\n'
+    '      "end_segment": <int>,\n'
+    '      "uncertain": true | false,\n'
+    '      "reason": "<empty string or brief reason when off-slide/uncertain>"\n'
+    "    }\n"
+    "  ]\n"
+    "}"
+)
 
 
 SECTION_NOTES_SYSTEM_PROMPT: str = (
@@ -522,6 +607,89 @@ def _strip_json_code_fence(raw_text: str) -> str:
     return cleaned
 
 
+def build_alignment_prompt(
+    slides: SlidesOCRArtifact,
+    transcript: TranscriptArtifact,
+) -> PromptMessages:
+    """Build the system + user prompts for aligning full transcript segments to lecture slides."""
+    ordered_slides = sorted(slides.slides, key=lambda item: item.slide)
+    lines: list[str] = [
+        f"Source PDF: {slides.source_pdf or 'slides.pdf'} ({len(ordered_slides)} slide(s))",
+        f"Transcript Segments: {len(transcript.segments)} (indices 0..{max(0, len(transcript.segments) - 1)})",
+        "",
+        "### Lecture Slides (Gemini OCR)",
+    ]
+    if ordered_slides:
+        for slide in ordered_slides:
+            lines.append(f"#### Slide {slide.slide}")
+            visible = slide.visible_text.strip()
+            visual = slide.visual_context.strip()
+            tables = slide.tables_code_formulas.strip()
+            if visible:
+                lines.append("VISIBLE_TEXT:")
+                lines.append(visible)
+            if visual:
+                lines.append("VISUAL_CONTEXT:")
+                lines.append(visual)
+            if tables:
+                lines.append("TABLES_CODE_FORMULAS:")
+                lines.append(tables)
+            if not (visible or visual or tables):
+                raw = slide.raw_text.strip()
+                lines.append(raw if raw else "(blank slide)")
+            lines.append("")
+    else:
+        lines.append("(No slides available; mark all segments off-slide with slide=null.)")
+        lines.append("")
+
+    lines.append("### Chronological Transcript Segments")
+    for idx, seg in enumerate(transcript.segments):
+        seg_range = format_timestamp_range(seg.start, seg.end)
+        lines.append(f"- seg {idx} {seg_range}: {seg.text.strip()}")
+
+    lines.extend(
+        [
+            "",
+            "Align every segment index from 0 to "
+            f"{max(0, len(transcript.segments) - 1)} in chronological order and return ONLY "
+            "the JSON object with the 'entries' array.",
+        ]
+    )
+
+    return PromptMessages(
+        system=ALIGNMENT_SYSTEM_PROMPT,
+        user="\n".join(lines),
+    )
+
+
+def parse_alignment_response(raw_response: str | dict[str, Any] | Sequence[Any]) -> list[dict[str, Any]]:
+    """Parse a JSON alignment response into a list of raw alignment entry dicts."""
+    if isinstance(raw_response, str):
+        cleaned = _strip_json_code_fence(raw_response)
+        try:
+            data: Any = json.loads(cleaned)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Alignment response is not valid JSON: {exc}") from exc
+    else:
+        data = raw_response
+
+    if isinstance(data, dict):
+        if isinstance(data.get("entries"), list):
+            entries_raw = data["entries"]
+        elif isinstance(data.get("alignment"), list):
+            entries_raw = data["alignment"]
+        else:
+            raise ValueError("Alignment JSON object must contain an 'entries' list.")
+    elif isinstance(data, list):
+        entries_raw = data
+    else:
+        raise ValueError(
+            f"Alignment response must decode to a JSON object or array, got {type(data).__name__}."
+        )
+
+    return list(entries_raw)
+
+
 def parse_coverage_check_response(
     raw_response: str | dict[str, Any],
     *,
@@ -577,9 +745,14 @@ def parse_coverage_check_response(
             )
         )
 
-    total_count = int(data.get("total_segment_count", total_segment_count) or 0)
-    covered_default = max(0, total_count - len(gaps))
-    covered_count = int(data.get("covered_segment_count", covered_default) or 0)
+    try:
+        raw_total = data.get("total_segment_count", total_segment_count)
+        total_count = int(total_segment_count if raw_total is None else raw_total)
+        covered_default = max(0, total_count - len(gaps))
+        raw_covered = data.get("covered_segment_count", covered_default)
+        covered_count = int(covered_default if raw_covered is None else raw_covered)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Coverage check segment counts must be integers: {exc}") from exc
     passed_raw = data.get("passed")
     passed = bool(passed_raw) if isinstance(passed_raw, bool) else (len(gaps) == 0)
     if gaps:
@@ -598,6 +771,9 @@ def parse_coverage_check_response(
 
 __all__ = [
     "AI_FIRST_MARKDOWN_RULES",
+    "ALIGNMENT_RESPONSE_JSON_SCHEMA",
+    "ALIGNMENT_SYSTEM_PROMPT",
+    "COVERAGE_CHECK_RESPONSE_JSON_SCHEMA",
     "COVERAGE_CHECK_SYSTEM_PROMPT",
     "CoverageCheckInput",
     "CoverageCheckResult",
@@ -611,9 +787,11 @@ __all__ = [
     "SectionPromptInput",
     "SectionPromptSegment",
     "SectionPromptSlide",
+    "build_alignment_prompt",
     "build_coverage_check_prompt",
     "build_section_notes_prompt",
     "format_timestamp",
     "format_timestamp_range",
+    "parse_alignment_response",
     "parse_coverage_check_response",
 ]
