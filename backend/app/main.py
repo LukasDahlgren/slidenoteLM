@@ -287,10 +287,11 @@ def _build_queue_snapshot_response(
     snapshot = store.get_queue_snapshot(recent_limit=recent_limit, batch_id=batch_id)
     runtime_by_token = worker.get_all_runtime_meta()
 
+    llm_slots = max(1, settings.queue_lane_llm_concurrency)
     active_responses: list[JobStatusResponse] = []
     for idx, job in enumerate(snapshot["active"]):
         tok = str(job["token"])
-        default_role: PipelineRole = "primary" if idx == 0 else "preparing"
+        default_role: PipelineRole = "primary" if idx < llm_slots else "preparing"
         meta = runtime_by_token.get(tok, (default_role, None))
         active_responses.append(_job_to_status_response(job, runtime_meta=meta))
 

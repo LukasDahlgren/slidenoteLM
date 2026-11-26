@@ -45,7 +45,7 @@ class ParallelNotesTests(unittest.TestCase):
         defaults = {
             "LLM_NOTES_PARALLEL_WORKERS": (9, 1), "LLM_COVERAGE_PARALLEL_WORKERS": (4, 1),
             "OCR_MAX_PAGES_PER_BATCH": (8, 1), "OCR_PARALLEL_WORKERS": (8, 1),
-            "OCR_GLOBAL_MAX_CONCURRENT": (8, 1), "LLM_GLOBAL_MAX_CONCURRENT": (12, 1),
+            "OCR_GLOBAL_MAX_CONCURRENT": (16, 1), "LLM_GLOBAL_MAX_CONCURRENT": (24, 1),
             "NOTES_MAX_SLIDES_PER_SECTION": (8, 1), "NOTES_MAX_SECTION_DURATION_SECONDS": (900, 30),
             "NOTES_MAX_SECTION_TRANSCRIPT_CHARS": (14000, 500),
             "NOTES_INLINE_OFF_SLIDE_MAX_SECONDS": (35, 0), "NOTES_INLINE_OFF_SLIDE_MAX_CHARS": (300, 0),
@@ -59,7 +59,7 @@ class ParallelNotesTests(unittest.TestCase):
                 for key, (default, minimum) in defaults.items():
                     expected = default if override is None else max(minimum, int(override))
                     self.assertEqual(getattr(cfg, key.lower()), expected)
-                self.assertEqual((cfg.llm_notes_max_output_tokens, cfg.llm_rate_limit_rpm), (49152, 30))
+                self.assertEqual((cfg.llm_notes_max_output_tokens, cfg.llm_rate_limit_rpm), (49152, 90))
 
     def test_pdf_batch_sizes(self):
         for count, expected in ((5, [3, 2]), (51, [8, 8, 7, 7, 7, 7, 7])):
@@ -118,12 +118,15 @@ class ParallelNotesTests(unittest.TestCase):
             )
 
         client = SimpleNamespace(models=SimpleNamespace(generate_content=respond))
+        progress = []
         result = generate_notes(
             *lecture([1, 1, 1, 1, 1, 2]),
             _make_settings(Path("."), notes_max_slides_per_section=1, notes_min_audit_transcript_chars=0,
                            llm_retry_attempts=1, llm_rate_limit_rpm=0),
             client_factory=lambda _: client,
+            progress_fraction_callback=progress.append,
         )
+        self.assertEqual(progress, [0.25, 0.5, 0.75, 1.0])
         self.assertEqual(peak, 2)
         self.assertLess(result.markdown.index("## Finished section 1"), result.markdown.index("## Finished section 2"))
         first, second = result.prompt_inputs
@@ -141,11 +144,14 @@ class ParallelNotesTests(unittest.TestCase):
     def test_small_sections_skip_api_audit_without_false_certification(self):
         for workers in (1, 2):
             client = _FakeTextClient(["## Draft"] * 2)
+            progress = []
             result = generate_notes(
                 *lecture([1, 2]), _make_settings(Path("."), notes_max_slides_per_section=1,
                                                  llm_notes_parallel_workers=workers, llm_rate_limit_rpm=0),
                 client_factory=lambda _: client,
+                progress_fraction_callback=progress.append,
             )
+            self.assertEqual(progress, [0.5, 1.0])
             self.assertEqual(len(client.calls), 2)
             self.assertEqual(result.coverage_input_tokens, 0)
             self.assertEqual(result.coverage_result.checked_sections, 0)

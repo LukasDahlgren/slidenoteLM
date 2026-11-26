@@ -79,14 +79,14 @@ class _ActiveJobState:
 
 
 class JobWorker:
-    """SQLite-backed 4-lane stage-pipelined coordinator for sequential lecture queues.
+    """SQLite-backed 4-lane multi-slot stage-pipelined coordinator for lecture queues.
 
-    Runs up to `settings.queue_max_in_flight_jobs` (default 2: 1 primary head + 1
-    pre-warming lookahead) across 4 independent resource lanes:
+    Runs up to `settings.queue_max_in_flight_jobs` lectures concurrently across 4
+    independent resource lanes with per-lane concurrency limits:
       - `audio_prep` (local ffmpeg CPU/disk)
       - `transcription` (Groq Whisper)
-      - `ocr` (Gemini OCR, rate-limit coordinated with `llm`)
-      - `llm` (Gemini alignment -> notes)
+      - `ocr` (Google Gemini OCR, rate-limit coordinated with `llm`)
+      - `llm` (Google Gemini alignment -> notes)
     """
 
     def __init__(
@@ -101,17 +101,27 @@ class JobWorker:
         if stage_handlers:
             self._handlers.update(stage_handlers)
 
+        self._lane_capacity: dict[str, int] = {
+            "audio_prep": max(1, int(getattr(settings, "queue_lane_audio_prep_concurrency", 2))),
+            "transcription": max(
+                1, int(getattr(settings, "queue_lane_transcription_concurrency", 2))
+            ),
+            "ocr": max(1, int(getattr(settings, "queue_lane_ocr_concurrency", 3))),
+            "llm": max(1, int(getattr(settings, "queue_lane_llm_concurrency", 3))),
+        }
+
         self._cond = threading.Condition(threading.RLock())
         self._stopping = False
         self._started = False
         self._coordinator_thread: threading.Thread | None = None
         self._stage_pool = ThreadPoolExecutor(
-            max_workers=len(ALL_LANES),
+            max_workers=max(len(ALL_LANES), sum(self._lane_capacity.values())),
             thread_name_prefix="slidenotelm-lane",
         )
         self._in_flight: dict[str, _ActiveJobState] = {}
-        self._lane_owner: dict[str, str | None] = {lane: None for lane in ALL_LANES}
-        self._lane_stage: dict[str, PipelineStage | None] = {lane: None for lane in ALL_LANES}
+        self._lane_active: dict[str, dict[str, PipelineStage]] = {
+            lane: {} for lane in ALL_LANES
+        }
         self._done_events: dict[str, threading.Event] = {}
 
     def start(self) -> None:
@@ -184,14 +194,18 @@ class JobWorker:
                     raise TimeoutError(f"Timed out waiting for queue idle after {timeout:.1f}s.")
                 self._cond.wait(timeout=min(0.1, remaining))
 
+    def _primary_tokens_locked(self, ordered: list[_ActiveJobState]) -> set[str]:
+        llm_slots = max(1, self._lane_capacity["llm"])
+        return {js.token for js in ordered[:llm_slots]}
+
     def get_runtime_job_meta(self, token: str) -> tuple[PipelineRole | None, str | None]:
         """Return (pipeline_role, waiting_reason) for an in-flight job."""
         with self._cond:
             if token not in self._in_flight:
                 return None, None
             ordered = self._ordered_in_flight_locked()
-            primary_token = ordered[0].token if ordered else None
-            role: PipelineRole = "primary" if token == primary_token else "preparing"
+            primaries = self._primary_tokens_locked(ordered)
+            role: PipelineRole = "primary" if token in primaries else "preparing"
             return role, self._in_flight[token].waiting_reason
 
     def get_all_runtime_meta(self) -> dict[str, tuple[PipelineRole, str | None]]:
@@ -200,16 +214,21 @@ class JobWorker:
             ordered = self._ordered_in_flight_locked()
             if not ordered:
                 return {}
-            primary_token = ordered[0].token
+            primaries = self._primary_tokens_locked(ordered)
             return {
                 js.token: (
-                    "primary" if js.token == primary_token else "preparing",
+                    "primary" if js.token in primaries else "preparing",
                     js.waiting_reason,
                 )
                 for js in ordered
             }
 
-    def cancel_job(self, token: str, *, delete_files: bool | None = None) -> tuple[str, dict[str, Any] | None]:
+    def cancel_job(
+        self,
+        token: str,
+        *,
+        delete_files: bool | None = None,
+    ) -> tuple[str, dict[str, Any] | None]:
         """Cancel a queued or active job.
 
         Returns a status tag ('cancelled', 'cancelling', 'not_found', 'not_cancellable')
@@ -249,7 +268,6 @@ class JobWorker:
         if reloaded["status"] == "cancelled":
             return "cancelled", reloaded
         if reloaded["status"] == "processing":
-            # Edge case: claimed in DB but not yet registered in _in_flight; mark cancelled directly.
             if self.store.mark_job_cancelled(token):
                 with self._cond:
                     self._signal_done_locked(token)
@@ -275,6 +293,12 @@ class JobWorker:
     def _ordered_in_flight_locked(self) -> list[_ActiveJobState]:
         return sorted(self._in_flight.values(), key=lambda js: (js.queue_position, js.token))
 
+    def _lane_has_capacity_locked(self, lane: str) -> bool:
+        return len(self._lane_active[lane]) < self._lane_capacity[lane]
+
+    def _other_job_holds_llm_locked(self, token: str | None) -> bool:
+        return any(owner != token for owner in self._lane_active["llm"])
+
     def _signal_done_locked(self, token: str) -> None:
         event = self._done_events.get(token)
         if event is not None:
@@ -283,7 +307,7 @@ class JobWorker:
     def _can_admit_lookahead_locked(self, paused: bool) -> bool:
         if paused:
             return False
-        max_in_flight = max(1, int(getattr(self.settings, "queue_max_in_flight_jobs", 2)))
+        max_in_flight = max(1, int(getattr(self.settings, "queue_max_in_flight_jobs", 4)))
         if len(self._in_flight) >= max_in_flight:
             return False
         if not self._in_flight:
@@ -304,23 +328,37 @@ class JobWorker:
         if not ready_stages:
             return True
 
-        # Lazy admission: keep J2 cleanly 'queued' (reorderable/cancellable) until its
-        # primary entry lane (normally audio_prep) is actually free.
+        # Lazy admission: keep waiting jobs cleanly 'queued' (reorderable/cancellable)
+        # until an entry lane they need actually has a free slot.
         if "audio_prep" in ready_stages:
-            return self._lane_owner["audio_prep"] is None
-        if "transcription" in ready_stages:
-            return self._lane_owner["transcription"] is None
-        if "ocr" in ready_stages:
-            if self._lane_owner["ocr"] is not None:
-                return False
+            if self._lane_has_capacity_locked("audio_prep"):
+                return True
+            # When OCR allows multi-lecture concurrency (>1), admit immediately so OCR can
+            # run while waiting for an audio_prep slot; when OCR is single-slot, wait for
+            # audio_prep so J2 doesn't claim prematurely before J1 finishes ffmpeg.
             if (
-                self._lane_owner["llm"] is not None
+                "ocr" in ready_stages
+                and self._lane_capacity["ocr"] > 1
+                and self._lane_has_capacity_locked("ocr")
+                and not (
+                    self._other_job_holds_llm_locked(None)
+                    and self.settings.queue_ocr_overlap_with_llm == "strict"
+                )
+            ):
+                return True
+            return False
+
+        if "transcription" in ready_stages and self._lane_has_capacity_locked("transcription"):
+            return True
+        if "ocr" in ready_stages and self._lane_has_capacity_locked("ocr"):
+            if (
+                self._other_job_holds_llm_locked(None)
                 and self.settings.queue_ocr_overlap_with_llm == "strict"
             ):
                 return False
             return True
-        if "alignment" in ready_stages or "notes" in ready_stages:
-            return self._lane_owner["llm"] is None
+        if ("alignment" in ready_stages or "notes" in ready_stages) and self._lane_has_capacity_locked("llm"):
+            return True
         return False
 
     def _build_active_job_state(self, job: dict[str, Any]) -> _ActiveJobState:
@@ -362,7 +400,7 @@ class JobWorker:
     ) -> Settings:
         if (
             stage == "ocr"
-            and self._lane_owner["llm"] not in (None, js.token)
+            and self._other_job_holds_llm_locked(js.token)
             and self.settings.queue_ocr_overlap_with_llm == "paced"
         ):
             lookahead_cap = max(1, int(self.settings.queue_lookahead_ocr_workers))
@@ -414,9 +452,9 @@ class JobWorker:
                     self._in_flight[token] = js
                     dispatched_any = True
 
-                # 2. Dispatch ready stages strictly in queue_position ASC order (primary first).
+                # 2. Dispatch ready stages strictly in queue_position ASC order.
                 ordered = self._ordered_in_flight_locked()
-                primary_token = ordered[0].token if ordered else None
+                primaries = self._primary_tokens_locked(ordered)
 
                 for js in ordered:
                     js.waiting_reason = None
@@ -437,9 +475,9 @@ class JobWorker:
                             dispatched_any = True
                         continue
 
-                    # When paused, allow primary head job to finish cleanly, but do not start
-                    # new stages on lookahead jobs.
-                    if paused and js.token != primary_token:
+                    # When paused, allow primary jobs to finish cleanly, but do not start
+                    # new stages on lookahead ('preparing') jobs.
+                    if paused and js.token not in primaries:
                         if not js.running_stages:
                             js.waiting_reason = "Queue paused."
                         continue
@@ -455,30 +493,32 @@ class JobWorker:
                     block_reasons: list[str] = []
                     for stage in ready_stages:
                         lane = STAGE_LANE[stage]
-                        owner = self._lane_owner[lane]
-                        if owner is not None:
-                            owner_stage = self._lane_stage[lane]
-                            owner_label = STAGE_LABELS[owner_stage] if owner_stage else lane
+                        if not self._lane_has_capacity_locked(lane):
+                            active_stages = list(self._lane_active[lane].values())
+                            owner_label = (
+                                STAGE_LABELS[active_stages[0]] if active_stages else lane
+                            )
                             block_reasons.append(
-                                f"Waiting for previous lecture to finish {owner_label}."
+                                f"Waiting for an active lecture to finish {owner_label}."
                             )
                             continue
 
                         if (
                             stage == "ocr"
-                            and self._lane_owner["llm"] not in (None, js.token)
+                            and self._other_job_holds_llm_locked(js.token)
                             and self.settings.queue_ocr_overlap_with_llm == "strict"
                         ):
-                            owner_stage = self._lane_stage["llm"]
-                            owner_label = STAGE_LABELS[owner_stage] if owner_stage else "LLM stage"
+                            llm_stages = list(self._lane_active["llm"].values())
+                            owner_label = (
+                                STAGE_LABELS[llm_stages[0]] if llm_stages else "LLM stage"
+                            )
                             block_reasons.append(
-                                f"Waiting for previous lecture to finish {owner_label} (strict Gemini pacing)."
+                                f"Waiting for active lecture to finish {owner_label} (strict Gemini pacing)."
                             )
                             continue
 
                         effective_settings = self._effective_settings_for_stage_locked(js, stage)
-                        self._lane_owner[lane] = js.token
-                        self._lane_stage[lane] = stage
+                        self._lane_active[lane][js.token] = stage
                         js.running_stages.add(stage)
                         self.store.start_stage(js.token, stage)
                         ctx = self._stage_context(js, stage)
@@ -487,9 +527,7 @@ class JobWorker:
                                 self._handlers[stage], ctx, effective_settings
                             )
                         except RuntimeError:
-                            # Executor shutting down.
-                            self._lane_owner[lane] = None
-                            self._lane_stage[lane] = None
+                            self._lane_active[lane].pop(js.token, None)
                             js.running_stages.discard(stage)
                             return
 
@@ -538,9 +576,8 @@ class JobWorker:
             exc = err
 
         with self._cond:
-            if self._lane_owner.get(lane) == token:
-                self._lane_owner[lane] = None
-                self._lane_stage[lane] = None
+            if self._lane_active[lane].get(token) == stage:
+                self._lane_active[lane].pop(token, None)
 
             js = self._in_flight.get(token)
             if js is None:

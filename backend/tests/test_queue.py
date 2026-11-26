@@ -38,6 +38,10 @@ def _make_settings(tmp_dir: Path, **overrides: object) -> Settings:
         "pipeline_llm_mode": "stub",
         "worker_concurrency": 1,
         "queue_max_in_flight_jobs": 2,
+        "queue_lane_audio_prep_concurrency": 1,
+        "queue_lane_transcription_concurrency": 1,
+        "queue_lane_ocr_concurrency": 1,
+        "queue_lane_llm_concurrency": 1,
         "queue_ocr_overlap_with_llm": "paced",
         "queue_lookahead_ocr_workers": 2,
         "cleanup_raw_recording_after_audio_prep": True,
@@ -240,6 +244,77 @@ class QueuePipeliningTests(unittest.TestCase):
             self.assertEqual(snap_end["counts"]["completed"], 3)
             self.assertEqual(snap_end["active"], [])
             self.assertEqual(snap_end["queued"], [])
+
+    def test_multi_slot_lanes_process_multiple_lectures_simultaneously(self) -> None:
+        # With default multi-slot lanes (audio=2, transcription=2, ocr=3, llm=3, max_in_flight=4):
+        # J1, J2, J3 must genuinely run `notes` in parallel while J4 pre-warms and J5 stays queued.
+        notes_lock = threading.Lock()
+        active_notes: set[str] = set()
+        three_in_notes = threading.Event()
+        release_notes = threading.Event()
+        j4_prepared = threading.Event()
+        j5_started = threading.Event()
+
+        def audio_prep(ctx: JobContext, settings: Settings) -> StageResult:
+            if ctx.slides_filename == "lec5.pdf":
+                j5_started.set()
+            return _stub_audio_prep(ctx, settings)
+
+        def transcription(ctx: JobContext, settings: Settings) -> StageResult:
+            res = _stub_transcription(ctx, settings)
+            if ctx.slides_filename == "lec4.pdf":
+                j4_prepared.set()
+            return res
+
+        def notes(ctx: JobContext, settings: Settings) -> StageResult:
+            if ctx.slides_filename in {"lec1.pdf", "lec2.pdf", "lec3.pdf"}:
+                with notes_lock:
+                    active_notes.add(ctx.slides_filename)
+                    if len(active_notes) == 3:
+                        three_in_notes.set()
+                self.assertTrue(release_notes.wait(timeout=5.0))
+            return _stub_notes(ctx, settings)
+
+        app = create_app(
+            settings=_make_settings(
+                self.tmp_dir,
+                queue_max_in_flight_jobs=4,
+                queue_lane_audio_prep_concurrency=2,
+                queue_lane_transcription_concurrency=2,
+                queue_lane_ocr_concurrency=3,
+                queue_lane_llm_concurrency=3,
+                queue_ocr_overlap_with_llm="full",
+            ),
+            stage_handlers=_stub_handlers(
+                audio_prep=audio_prep,
+                transcription=transcription,
+                notes=notes,
+            ),
+        )
+
+        with TestClient(app) as client:
+            jobs = [_upload_pair(client, f"lec{i}") for i in range(1, 6)]
+
+            # All 3 primary lectures reach `notes` concurrently AND J4 pre-warms in parallel!
+            self.assertTrue(three_in_notes.wait(timeout=5.0))
+            self.assertTrue(j4_prepared.wait(timeout=5.0))
+            self.assertFalse(j5_started.is_set())
+
+            snap = client.get("/api/queue").json()
+            self.assertEqual(len(snap["active"]), 4)
+            roles = [item["pipeline_role"] for item in snap["active"]]
+            self.assertEqual(roles, ["primary", "primary", "primary", "preparing"])
+            self.assertEqual([q["token"] for q in snap["queued"]], [jobs[4]["token"]])
+
+            release_notes.set()
+            for j in jobs:
+                app.state.worker.wait_for_job(j["token"], timeout=5.0)
+
+            self.assertTrue(j5_started.is_set())
+            final_snap = client.get("/api/queue").json()
+            self.assertEqual(final_snap["counts"]["completed"], 5)
+            self.assertEqual(final_snap["active"], [])
+            self.assertEqual(final_snap["queued"], [])
 
     def test_strict_serial_mode_max_in_flight_1_waits_for_j1_to_complete(self) -> None:
         j1_notes_started = threading.Event()
@@ -691,10 +766,14 @@ class QueuePipeliningTests(unittest.TestCase):
 
         # Env var parsing check
         env_patch = {
-            "QUEUE_MAX_IN_FLIGHT_JOBS": "3",
+            "QUEUE_MAX_IN_FLIGHT_JOBS": "5",
+            "QUEUE_LANE_AUDIO_PREP_CONCURRENCY": "3",
+            "QUEUE_LANE_TRANSCRIPTION_CONCURRENCY": "2",
+            "QUEUE_LANE_OCR_CONCURRENCY": "4",
+            "QUEUE_LANE_LLM_CONCURRENCY": "4",
             "QUEUE_OCR_OVERLAP_WITH_LLM": "strict",
             "QUEUE_LOOKAHEAD_OCR_WORKERS": "4",
-            "GEMINI_COMBINED_RATE_LIMIT_RPM": "55",
+            "GEMINI_COMBINED_RATE_LIMIT_RPM": "150",
             "QUEUE_AUTO_PAUSE_ON_AUTH_ERROR": "false",
             "CLEANUP_RAW_RECORDING_AFTER_AUDIO_PREP": "false",
             "MAX_QUEUE_DEPTH": "25",
@@ -703,10 +782,14 @@ class QueuePipeliningTests(unittest.TestCase):
         }
         with mock.patch.dict(os.environ, env_patch, clear=False):
             cfg = load_settings(env_file=self.tmp_dir / "nonexistent.env")
-        self.assertEqual(cfg.queue_max_in_flight_jobs, 3)
+        self.assertEqual(cfg.queue_max_in_flight_jobs, 5)
+        self.assertEqual(cfg.queue_lane_audio_prep_concurrency, 3)
+        self.assertEqual(cfg.queue_lane_transcription_concurrency, 2)
+        self.assertEqual(cfg.queue_lane_ocr_concurrency, 4)
+        self.assertEqual(cfg.queue_lane_llm_concurrency, 4)
         self.assertEqual(cfg.queue_ocr_overlap_with_llm, "strict")
         self.assertEqual(cfg.queue_lookahead_ocr_workers, 4)
-        self.assertEqual(cfg.gemini_combined_rate_limit_rpm, 55)
+        self.assertEqual(cfg.gemini_combined_rate_limit_rpm, 150)
         self.assertFalse(cfg.queue_auto_pause_on_auth_error)
         self.assertFalse(cfg.cleanup_raw_recording_after_audio_prep)
         self.assertEqual(cfg.max_queue_depth, 25)

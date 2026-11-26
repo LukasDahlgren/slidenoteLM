@@ -116,20 +116,27 @@ All `/api/*` endpoints use a built-in per-IP sliding-window rate limiter (emitti
 - `POST /api/jobs`: `10/min` (`RATE_LIMIT_JOBS_CREATE_PER_MINUTE`)
 - `GET /api/jobs/*` (status, preview, download): `120/min` (`RATE_LIMIT_JOBS_READ_PER_MINUTE`)
 - `GET /api/health` & other `/api/*`: `120/min` (`RATE_LIMIT_HEALTH_PER_MINUTE`, `RATE_LIMIT_DEFAULT_PER_MINUTE`)
-- Groq and OCR use independent 20 RPM limits. Slide alignment, notes and coverage share a 30 RPM limit.
+- Groq uses a 20 RPM limit. Gemini OCR uses 60 RPM and slide alignment, notes, and coverage share a 90 RPM limit (capped overall by `GEMINI_COMBINED_RATE_LIMIT_RPM=120`).
 
-Slide OCR runs alongside audio preparation and transcription. Alignment starts once the slide text and transcript are both ready.
+Multiple queued lectures process concurrently across 4 multi-slot stage lanes (`audio_prep`: 2, `transcription`: 2, `ocr`: 3, `llm`: 3; up to 4 lectures in flight at once). Slide OCR runs alongside audio preparation and transcription, and alignment starts once both are ready.
 
 Gemini drafts up to nine lecture sections at once. Each worker receives a slide outline and the previous four transcript segments for continuity. Coverage checks start as drafts finish, and the final document follows lecture order. Short off-slide remarks between slides stay in the surrounding section with their own timestamp. Sections under 200 transcript characters use a local coverage check.
 
 | Setting | Default |
 | --- | ---: |
+| `QUEUE_MAX_IN_FLIGHT_JOBS` | 4 |
+| `QUEUE_LANE_AUDIO_PREP_CONCURRENCY` | 2 |
+| `QUEUE_LANE_TRANSCRIPTION_CONCURRENCY` | 2 |
+| `QUEUE_LANE_OCR_CONCURRENCY` | 3 |
+| `QUEUE_LANE_LLM_CONCURRENCY` | 3 |
 | `OCR_MAX_PAGES_PER_BATCH` | 8 |
 | `OCR_PARALLEL_WORKERS` | 8 |
-| `OCR_GLOBAL_MAX_CONCURRENT` | 8 |
+| `OCR_GLOBAL_MAX_CONCURRENT` | 16 |
+| `OCR_RATE_LIMIT_RPM` | 60 |
 | `LLM_NOTES_MAX_OUTPUT_TOKENS` | 49152 |
-| `LLM_GLOBAL_MAX_CONCURRENT` | 12 |
-| `LLM_RATE_LIMIT_RPM` | 30 |
+| `LLM_GLOBAL_MAX_CONCURRENT` | 24 |
+| `LLM_RATE_LIMIT_RPM` | 90 |
+| `GEMINI_COMBINED_RATE_LIMIT_RPM` | 120 |
 | `LLM_NOTES_PARALLEL_WORKERS` | 9 |
 | `LLM_COVERAGE_PARALLEL_WORKERS` | 4 |
 | `NOTES_MAX_SLIDES_PER_SECTION` | 8 |
