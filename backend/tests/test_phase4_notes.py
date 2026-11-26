@@ -242,31 +242,60 @@ class TestPromptsSpecification(unittest.TestCase):
         self.assertEqual([rule.number for rule in AI_FIRST_MARKDOWN_RULES], list(range(1, 10)))
 
         prompt = SECTION_NOTES_SYSTEM_PROMPT.lower()
+        # Overall framing: preserve lecture + slides as one English Markdown source; NotebookLM handles partitioning/retrieval/study aids
+        self.assertIn("preserve what a student could learn", prompt)
+        self.assertIn("one english markdown source", prompt)
+        self.assertIn("notebooklm handles source partitioning, retrieval, and generated study aids", prompt)
+        # Old blanket pronoun replacement / self-contained chunk mandate removed
+        self.assertNotIn("replace ambiguous pronouns", prompt)
+        self.assertNotIn("every retrieved chunk stays self-contained", prompt)
         # Rule 1: length driven by teaching, no bullet caps / fixed quotas
-        self.assertIn("no fixed sentence counts", prompt.replace("never impose fixed sentence counts", "no fixed sentence counts"))
+        self.assertIn("never impose fixed sentence counts", prompt)
         self.assertIn("bullet caps", prompt)
         self.assertIn("word quotas", prompt)
-        # Rule 2: explicit over stylistic, pronoun replacement for NotebookLM
-        self.assertIn("notebooklm", prompt)
-        self.assertIn("ambiguous pronouns", prompt)
-        # Rule 3: preserve reasoning chains in sequence
+        self.assertIn("depth of the teaching determine length", prompt)
+        # Rule 2: clear exposition & narrow deictic/visual reference resolution
+        self.assertIn("this arrow", prompt)
+        self.assertIn("do not force every paragraph", prompt)
+        # Rule 3: preserve reasoning chains in sequence across slide boundaries
         self.assertIn("reasoning chains", prompt)
+        self.assertIn("cross slide boundaries", prompt)
         self.assertIn("why it failed", prompt)
-        # Rule 4: keep substantive spoken content, strip filler
+        # Rule 4: substantive spoken content, strip filler, attribution where it matters
         self.assertIn("student q&a", prompt)
-        self.assertIn("self-corrections", prompt)
         self.assertIn("spoken filler", prompt)
-        # Rule 5: connect speech to visuals using VISUAL_CONTEXT + ambiguity
+        self.assertIn("integrate slide content, visuals, and speech together", prompt)
+        self.assertIn("appears only on the slide", prompt)
+        self.assertIn("student proposes an interpretation", prompt)
+        self.assertIn("who asked, asserted, corrected, or speculated", prompt)
+        # Rule 5: connect speech to visuals + choose representation by what visual teaches
         self.assertIn("visual_context", prompt)
-        self.assertIn("ambiguity", prompt)
-        # Rule 6: exam guidance only when explicitly stated
+        self.assertIn("uncertainty", prompt)
+        self.assertIn("markdown table to preserve values and units", prompt)
+        self.assertIn("numbered sequence", prompt)
+        self.assertIn("ascii or mermaid diagram only when the supplied evidence establishes its connections", prompt)
+        # Rule 6: assessment cues, scope limits, and certainty level
+        self.assertIn("scope limits", prompt)
+        self.assertIn("important to understand", prompt)
+        self.assertIn("probably on the exam", prompt)
+        self.assertIn("will be on the exam", prompt)
         self.assertIn("time spent on a topic alone is never evidence", prompt)
-        # Rule 7: strict grounding
+        # Rule 7: strict grounding, metadata omission, meaning-based ASR & self-corrections
         self.assertIn("never invent missing logical steps", prompt)
-        self.assertIn("contradictions", prompt)
-        # Rule 8: chunk-friendly Markdown + timestamp-only fallback on uncertainty
+        self.assertIn("omit unknown metadata", prompt)
+        self.assertIn("source-supported course details", prompt)
+        self.assertIn("slide's spelling for an obvious transcription error", prompt)
+        self.assertIn("self-correction that changes the explanation", prompt)
+        self.assertIn("two plausible readings", prompt)
+        self.assertIn("short discrepancy note only when", prompt)
+        # Rule 8: natural topic headings, source anchors, uncertainty fallback, no generated study aids
+        self.assertIn("natural topic headings", prompt)
         self.assertIn("[mm:ss–mm:ss]", prompt)
         self.assertIn("timestamp alone instead of forcing a dubious slide number", prompt)
+        self.assertIn("repeat full heading hierarchies", prompt)
+        self.assertIn("empty categories or fixed per-slide blocks", prompt)
+        self.assertIn("leave generated study aids", prompt)
+        self.assertIn("concluding recap only if the lecturer or deck actually provides one", prompt)
         # Rule 9: rolling context + transcript coverage check
         self.assertIn("rolling context", prompt)
         self.assertIn("coverage", prompt)
@@ -314,6 +343,9 @@ class TestPromptsSpecification(unittest.TestCase):
         self.assertIn("VISUAL_CONTEXT:", aligned_msgs.user)
         self.assertIn("Timeline diagram with two candidates.", aligned_msgs.user)
         self.assertIn("Raft, Quorum, AppendEntries", aligned_msgs.user)
+        self.assertIn("integrate slide content, visuals, and spoken explanations together", aligned_msgs.user)
+        self.assertIn("identify the source explicitly when attribution matters", aligned_msgs.user)
+        self.assertIn("preserving what a student could learn", aligned_msgs.user)
 
         uncertain_input = SectionPromptInput(
             lecture_title="Raft Consensus",
@@ -376,6 +408,18 @@ class TestPromptsSpecification(unittest.TestCase):
         msgs = build_coverage_check_prompt(cov_input)
         self.assertEqual(msgs.system, COVERAGE_CHECK_SYSTEM_PROMPT)
         self.assertIn("Student asked about split brain scenarios.", msgs.user)
+        cov_system = msgs.system.lower()
+        cov_user = msgs.user.lower()
+        self.assertIn("missing step is a loss of meaning", cov_system)
+        self.assertIn("lost qualification or a change from tentative to definite is a loss of meaning", cov_system)
+        self.assertIn("appears once", cov_system)
+        self.assertIn("supported by both slide and speech", cov_system)
+        self.assertIn("who asked, asserted, corrected, or speculated", cov_system)
+        self.assertIn("scope limits", cov_system)
+        self.assertIn("level of certainty", cov_system)
+        self.assertIn("explanation-changing self-corrections", cov_system)
+        self.assertIn("tentative to definite", cov_user)
+        self.assertIn("supported by both slide and speech", cov_user)
 
         fenced_json = """```json
         {

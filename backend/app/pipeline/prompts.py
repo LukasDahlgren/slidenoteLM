@@ -13,7 +13,7 @@ CoverageSeverity = Literal["warning", "error"]
 
 @dataclass(frozen=True)
 class PromptSpecRule:
-    """Single rule from the AI-First Markdown Specification for NotebookLM."""
+    """Single rule from the Lecture Source Markdown Specification for NotebookLM."""
 
     number: int
     name: str
@@ -26,20 +26,22 @@ AI_FIRST_MARKDOWN_RULES: tuple[PromptSpecRule, ...] = (
         name="Length driven by teaching",
         guidance=(
             "Never impose fixed sentence counts, bullet caps, or per-slide word quotas. "
-            "Scale detail strictly to teaching depth: a title or transition slide may take "
-            "one concise line, whereas a 12-minute diagram walkthrough or derivation requires "
-            "dense, detailed, multi-part coverage."
+            "Let the depth of the teaching determine length: a title or transition slide "
+            "may take one concise line, whereas a 12-minute diagram walkthrough or "
+            "derivation requires detailed, multi-part coverage."
         ),
     ),
     PromptSpecRule(
         number=2,
-        name="Explicit over stylistic",
+        name="Clear exposition and resolved references",
         guidance=(
-            "Optimize for NotebookLM AI retrieval and Q&A rather than literary prose. "
-            "Use crisp, structured, information-dense statements, step-by-step sequences, "
-            "and explicit causal links. Replace ambiguous pronouns ('it', 'this', 'that', "
-            "'they', 'that method', 'the former') with explicit concept names so every "
-            "retrieved chunk stays self-contained and unambiguous."
+            "Write clear, direct, information-dense English with explicit causal links "
+            "rather than padded narrative. Resolve deictic and visual references—such as "
+            "'this arrow', 'that curve', 'here', or 'the box on the right'—to the concrete "
+            "concept or visual element when the slide or surrounding explanation establishes "
+            "their meaning, and note uncertainty when the intended target is ambiguous. Do "
+            "not force every paragraph to repeat concept names or stand as an isolated "
+            "self-contained chunk."
         ),
     ),
     PromptSpecRule(
@@ -47,80 +49,106 @@ AI_FIRST_MARKDOWN_RULES: tuple[PromptSpecRule, ...] = (
         name="Preserve reasoning chains in sequence",
         guidance=(
             "Record multi-step derivations, proofs, debugging walkthroughs, and worked "
-            "examples in exact logical sequence. If the lecturer walks through three steps "
-            "and explains why the third step fails, capture every step, what happened, and "
-            "why it failed. Never compress a worked example into a vague summary such as "
-            "'the lecturer demonstrated a failure'."
+            "explanations in exact logical sequence, including steps that cross slide "
+            "boundaries. If the lecturer walks through three steps and explains why the "
+            "third step fails, capture every step, what happened, and why it failed. Never "
+            "compress a worked example into a vague summary such as 'the lecturer "
+            "demonstrated a failure'."
         ),
     ),
     PromptSpecRule(
         number=4,
-        name="Keep substantive spoken content",
+        name="Substantive spoken content and attribution",
         guidance=(
-            "Preserve all substantive spoken teaching: concrete examples, analogies, "
-            "definitions, exceptions, edge cases, self-corrections, caveats, and "
-            "substantive student Q&A together with the lecturer's answers. Strip only "
-            "spoken filler ('um', 'uh', 'you know'), false starts, operational chatter "
-            "(microphone checks, room logistics), and empty repetition—while retaining "
-            "any new nuance or clarification added by a second explanation."
+            "Preserve every substantive spoken explanation: mechanisms, concrete examples, "
+            "analogies, definitions, exceptions, edge cases, caveats, and substantive "
+            "student Q&A together with the lecturer's answers. Strip only spoken filler "
+            "('um', 'uh', 'you know'), false starts, operational chatter (microphone checks, "
+            "room logistics), and empty repetition—while retaining any new nuance or "
+            "clarification added by a second explanation. Integrate slide content, visuals, "
+            "and speech together rather than splitting them into separate blocks for every "
+            "topic; identify the source explicitly whenever attribution matters—such as "
+            "when a claim appears only on the slide, a student proposes an interpretation, "
+            "or speech conflicts with a diagram—and preserve who asked, asserted, "
+            "corrected, or speculated whenever that distinction affects meaning."
         ),
     ),
     PromptSpecRule(
         number=5,
-        name="Connect speech to visuals",
+        name="Connect speech to visuals by what they teach",
         guidance=(
             "Use Gemini OCR VISUAL_CONTEXT (together with VISIBLE_TEXT and "
-            "TABLES_CODE_FORMULAS) to ground spoken deictic references such as 'this arrow', "
-            "'the second curve', or 'the box on the right' to the specific visual element "
-            "when supported by the slide and recording. When the intended visual target is "
-            "ambiguous or not confirmed by OCR, explicitly note the ambiguity instead of guessing."
+            "TABLES_CODE_FORMULAS) to ground spoken references to figures, curves, arrows, "
+            "tables, or diagrams when supported by the slide and recording; when the "
+            "intended visual target is ambiguous or not confirmed by OCR, explicitly note "
+            "the uncertainty instead of guessing. Choose the Markdown representation by "
+            "what the visual teaches: use prose to capture a relationship, a Markdown table "
+            "to preserve values and units, a numbered sequence to explain a flow or "
+            "process, and an ASCII or Mermaid diagram only when the supplied evidence "
+            "establishes its connections and a drawing conveys them more clearly."
         ),
     ),
     PromptSpecRule(
         number=6,
-        name="Accurate exam and study guidance",
+        name="Assessment cues and scope boundaries",
         guidance=(
-            "Tag exam hints, assessment priorities, or study-focus callouts ONLY when the "
-            "lecturer explicitly states them (for example, 'this will be on the midterm' or "
-            "'expect a question like this on the final'). Time spent on a topic alone is "
-            "never evidence that it will be assessed."
+            "Keep explicit assessment requirements, exam hints, and explicit scope limits "
+            "(what is in scope, out of scope, or not required to memorize) beside the "
+            "relevant concept with a [MM:SS–MM:SS] timestamp rather than moving them into "
+            "a separate checklist. Preserve the lecturer's level of certainty accurately: "
+            "'important to understand' alone is a study cue, and 'probably on the exam' "
+            "carries a different commitment from 'will be on the exam'. Time spent on a "
+            "topic alone is never evidence that it will be assessed."
         ),
     ),
     PromptSpecRule(
         number=7,
-        name="Strict grounding",
+        name="Strict grounding, discrepancies, and self-corrections",
         guidance=(
-            "Preserve technical terms, equations, symbols, numbers, units, code snippets, "
-            "and qualifications verbatim and accurately. Never invent missing logical steps, "
-            "never silently resolve contradictions between a slide and spoken speech (record "
-            "both and note the discrepancy explicitly), and never present a paraphrase as a "
-            "direct quotation."
+            "Preserve technical terms, formulas, source-supplied variable definitions, "
+            "symbols, numbers, units, code snippets, and qualifications accurately. Never "
+            "invent missing logical steps, never present a paraphrase as a direct "
+            "quotation, and omit unknown metadata—using only source-supported course "
+            "details. Apply a meaning-based rule to ASR discrepancies and "
+            "self-corrections: use the slide's spelling for an obvious transcription error "
+            "when the intended term is clear; retain any self-correction that changes the "
+            "explanation; and when two plausible readings or a conflict between speech and "
+            "a slide or diagram would teach different things, identify what the transcript "
+            "and slide each support and leave the uncertainty visible, adding a short "
+            "discrepancy note only when a reader needs it to interpret the teaching."
         ),
     ),
     PromptSpecRule(
         number=8,
-        name="Chunk-friendly Markdown structure",
+        name="Natural topic headings and source anchors",
         guidance=(
-            "Structure notes for clean chunking and retrieval: use a clear lecture title "
-            "and descriptive topic headings naming the concrete concept explained; include "
-            "confirmed slide numbers and [MM:SS–MM:SS] timestamps where available; allow "
-            "topics to span multiple slides when the explanation spans multiple slides; "
-            "give substantive off-slide discussion, live demos, and student Q&A dedicated "
-            "timestamped sections; distinguish slide content from spoken-only additions "
-            "where helpful for grounding; and whenever slide alignment is uncertain "
-            "(unresolved alignment warnings, out-of-order jumps, or unaligned spans), use "
-            "the [MM:SS–MM:SS] timestamp alone instead of forcing a dubious slide number."
+            "Use descriptive natural topic headings naming the concrete concept explained, "
+            "with confirmed slide references (Slide N / Slides A–B) and [MM:SS–MM:SS] "
+            "timestamps. Let topics span multiple slides when several slides support one "
+            "argument, and let substantive off-slide discussion, live demos, and student "
+            "Q&A stand on their [MM:SS–MM:SS] timestamp. Whenever slide alignment is "
+            "uncertain (unresolved alignment warnings, out-of-order jumps, or unaligned "
+            "spans), use the [MM:SS–MM:SS] timestamp alone instead of forcing a dubious "
+            "slide number. Do not repeat full heading hierarchies or fill out empty "
+            "categories or fixed per-slide blocks. Leave generated study aids (such as a "
+            "formula glossary or exam checklist) to NotebookLM: keep formulas, "
+            "source-supplied variable definitions, and assessment guidance where they were "
+            "taught, and preserve a concluding recap only if the lecturer or deck actually "
+            "provides one."
         ),
     ),
     PromptSpecRule(
         number=9,
-        name="Long-lecture reliability",
+        name="Long-lecture continuity and reliability",
         guidance=(
             "Maintain continuity across section boundaries using the supplied rolling "
-            "context (prior section headings, introduced key terms, and ongoing multi-slide "
-            "examples or derivations) so multi-slide explanations remain coherent. Preserve "
-            "all substantive spoken content so downstream transcript coverage checks find "
-            "no silently dropped explanations, worked examples, corrections, or student Q&A."
+            "context (prior section headings, introduced key terms, and ongoing "
+            "multi-slide examples or derivations) and prior boundary transcript overlap so "
+            "explanations crossing slide or section boundaries remain coherent without "
+            "repeating already-documented material. Preserve every substantive "
+            "explanation, step, qualification, certainty level, attribution, scope limit, "
+            "correction, and student Q&A so downstream transcript coverage checks find no "
+            "loss of meaning."
         ),
     ),
 )
@@ -218,13 +246,14 @@ ALIGNMENT_SYSTEM_PROMPT: str = (
 
 
 SECTION_NOTES_SYSTEM_PROMPT: str = (
-    "You are an expert technical note-taker generating English Markdown lecture notes "
-    "optimized specifically for **NotebookLM (AI retrieval and Q&A)**.\n"
-    "Your primary reader is an AI retrieval system answering detailed factual and "
-    "reasoning questions—not a human skimming decorative prose. Prioritize factual "
-    "completeness, explicitness, self-contained chunks, and zero ambiguity over "
-    "stylistic flow or brevity.\n\n"
-    "Follow ALL 9 rules of the AI-First Markdown Specification strictly:\n"
+    "You are an expert technical note-taker preserving a lecture recording and slide deck "
+    "together as one English Markdown source for **NotebookLM**.\n"
+    "Your job is to preserve what a student could learn from the lecture recording and "
+    "slides together—faithfully, completely, and clearly. NotebookLM handles source "
+    "partitioning, retrieval, and generated study aids after upload, so focus on accurate "
+    "source fidelity, natural structure, and teaching depth rather than artificial "
+    "chunking or repetitive boilerplate.\n\n"
+    "Follow ALL 9 rules of the Lecture Source Markdown Specification strictly:\n"
     f"{_render_spec_rules_block()}\n\n"
     "Output requirements:\n"
     "- Output clean English Markdown for the requested lecture section only (do not wrap "
@@ -232,29 +261,53 @@ SECTION_NOTES_SYSTEM_PROMPT: str = (
     "- Start the section with a descriptive `##` heading naming the concrete concept(s) "
     "taught, followed by the appropriate anchor (`Slide N` / `Slides A–B` + `[MM:SS–MM:SS]` "
     "for confirmed aligned sections, or `[MM:SS–MM:SS]` ONLY for off-slide and uncertain sections).\n"
-    "- Do NOT invent slide numbers when a section is marked off-slide or uncertain.\n"
+    "- Do NOT invent slide numbers when a section is marked off-slide or uncertain, do NOT "
+    "invent unknown course/lecturer/date metadata (use only source-supported details), and "
+    "do NOT append generated study aids (formula glossaries or exam checklists) unless the "
+    "lecturer or slide deck actually provides a concluding recap.\n"
+    "- Do NOT repeat full heading hierarchies or force fixed per-slide templates or empty "
+    "categories; integrate slide content, visuals, and speech together and identify the "
+    "source explicitly where attribution affects meaning.\n"
     "- Do NOT cap bullet counts, do NOT truncate off-slide discussion, and do NOT omit "
-    "spoken-only nuance, worked-example steps, corrections, or student Q&A."
+    "spoken-only nuance, worked-example steps, qualifications, certainty levels, scope "
+    "limits, explanation-changing self-corrections, or student Q&A."
 )
 
 
 COVERAGE_CHECK_SYSTEM_PROMPT: str = (
-    "You are a strict transcript coverage auditor for NotebookLM-optimized lecture notes.\n"
+    "You are a strict transcript coverage auditor for a lecture Markdown source export.\n"
     "Your job is to compare one lecture section's chronological transcript against the "
     "generated Markdown notes for that section and detect any **silently dropped "
-    "substantive content**.\n\n"
-    "What counts as substantive (MUST be captured in the notes):\n"
-    "- Concept definitions, explanations, causal links, and reasoning chains (every step "
-    "and why a step succeeds or fails).\n"
-    "- Worked examples, analogies, edge cases, exceptions, caveats, and numerical/code details.\n"
-    "- Lecturer self-corrections or contradictions between spoken speech and slide text.\n"
-    "- Visual explanations referencing slide diagrams, curves, arrows, tables, or formulas.\n"
-    "- Substantive student questions and the lecturer's answers (Q&A).\n"
-    "- Explicit exam/assessment guidance stated by the lecturer.\n\n"
+    "substantive content or loss of meaning**.\n\n"
+    "What counts as substantive or a loss of meaning (MUST be captured accurately in the notes):\n"
+    "- Concept definitions, explanations, causal links, and reasoning chains—every step "
+    "in sequence and why a step succeeds or fails; a missing step is a loss of meaning.\n"
+    "- Worked examples, analogies, edge cases, exceptions, caveats, qualifications, and "
+    "numerical/code/formula details; a lost qualification or a change from tentative to "
+    "definite is a loss of meaning.\n"
+    "- Meaningful attribution when it affects what is taught: who asked, asserted, "
+    "corrected, or speculated (such as a student proposing an interpretation and how the "
+    "lecturer responded, including any uncertainty).\n"
+    "- Explanation-changing self-corrections and substantive discrepancies or conflicts "
+    "between spoken speech and slide content/diagrams (where two plausible readings would "
+    "teach different things).\n"
+    "- Visual explanations referencing slide diagrams, curves, arrows, tables, or formulas "
+    "(and preserving visible uncertainty when the referenced target is unclear).\n"
+    "- Explicit assessment cues, assignment requirements, exam hints, and scope limits "
+    "(what is in or out of scope), including their preserved level of certainty (for "
+    "example, 'important to understand' vs. 'probably on the exam' vs. 'will be on the "
+    "exam') and timestamps.\n\n"
     "What is NOT a coverage gap (ignore these):\n"
+    "- A clearly explained point that appears once in integrated prose/structure even when "
+    "it is supported by both slide and speech (do not require separate slide vs. speech "
+    "repetition).\n"
+    "- Obvious ASR transcription typos normalized to the clear slide spelling when the "
+    "intended term is unambiguous.\n"
     "- Spoken filler ('um', 'uh', 'you know'), false starts, and verbal stumbles.\n"
     "- Operational/logistical chatter (audio checks, breaks, seating, file-sharing logistics).\n"
-    "- Pure empty repetition that adds no new detail or nuance.\n\n"
+    "- Pure empty repetition that adds no new detail or nuance.\n"
+    "- Omitted generated study aids (formula glossaries or exam checklists) or omitted "
+    "unspoken/unknown metadata.\n\n"
     "Return ONLY valid JSON matching this exact schema:\n"
     "{\n"
     '  "passed": true | false,\n'
@@ -267,7 +320,7 @@ COVERAGE_CHECK_SYSTEM_PROMPT: str = (
     '      "start_time": <float seconds or null>,\n'
     '      "end_time": <float seconds or null>,\n'
     '      "segment_indices": [<int>, ...],\n'
-    '      "summary": "<concise explicit description of what was omitted>",\n'
+    '      "summary": "<concise explicit description of what was omitted or altered in meaning>",\n'
     '      "severity": "warning" | "error"\n'
     "    }\n"
     "  ],\n"
@@ -460,15 +513,17 @@ def _format_slide_range_label(slide_numbers: tuple[int, ...]) -> str:
 
 
 def build_section_notes_prompt(payload: SectionPromptInput) -> PromptMessages:
-    """Build the system + user prompts for one section of NotebookLM-optimized Markdown notes."""
+    """Build the system + user prompts for one section of the English lecture Markdown source."""
     ts_range = format_timestamp_range(payload.start_time, payload.end_time)
 
     if payload.section_kind == "aligned":
         anchor_instruction = (
             f"Confirmed slide anchor(s): {_format_slide_range_label(payload.slide_numbers)} "
-            f"covering {ts_range}. Include confirmed slide numbers and {ts_range} timestamps, "
-            "connect spoken references to VISUAL_CONTEXT, and distinguish slide content from "
-            "spoken-only additions."
+            f"covering {ts_range}. Include confirmed slide numbers and {ts_range} timestamps; "
+            "integrate slide content, visuals, and spoken explanations together; resolve spoken "
+            "deictic/visual references using VISUAL_CONTEXT when supported; and identify the "
+            "source explicitly when attribution matters (slide-only claims, student proposals, "
+            "or speech/slide conflicts)."
         )
     elif payload.section_kind == "off_slide":
         anchor_instruction = (
@@ -560,8 +615,9 @@ def build_section_notes_prompt(payload: SectionPromptInput) -> PromptMessages:
 
     lines.append("")
     lines.append(
-        "Generate the complete, information-dense, NotebookLM-ready English Markdown for "
-        "this section now, following all 9 rules of the AI-First Markdown Specification."
+        "Generate the complete, faithful English Markdown source for this section now, "
+        "preserving what a student could learn from the recording and slides together "
+        "and following all 9 rules of the Lecture Source Markdown Specification."
     )
 
     return PromptMessages(
@@ -571,7 +627,7 @@ def build_section_notes_prompt(payload: SectionPromptInput) -> PromptMessages:
 
 
 def build_coverage_check_prompt(payload: CoverageCheckInput) -> PromptMessages:
-    """Build the system + user prompts to verify no substantive spoken content was dropped."""
+    """Build the system + user prompts to verify no substantive spoken content or meaning was lost."""
     ts_range = format_timestamp_range(payload.start_time, payload.end_time)
     anchor_desc = (
         f"{_format_slide_range_label(payload.slide_numbers)} {ts_range}"
@@ -599,9 +655,13 @@ def build_coverage_check_prompt(payload: CoverageCheckInput) -> PromptMessages:
             "### Generated Markdown Notes To Audit",
             payload.generated_markdown.strip() or "(empty)",
             "",
-            "Audit every substantive explanation, reasoning chain, worked example, "
-            "definition, exception, self-correction, visual reference, explicit exam hint, "
-            "and student Q&A in the transcript against the generated Markdown and return "
+            "Audit every substantive explanation, reasoning-chain step, worked example, "
+            "definition, qualification, exception, explanation-changing self-correction or "
+            "discrepancy, visual reference, explicit assessment cue or scope limit (with "
+            "certainty level), and attributed student Q&A in the transcript against the "
+            "generated Markdown. Flag any missing step, lost qualification, or shift from "
+            "tentative to definite as a loss of meaning, while accepting a single clear "
+            "integrated explanation even when supported by both slide and speech. Return "
             "ONLY the required JSON object.",
         ]
     )

@@ -1,6 +1,6 @@
 # slidenoteLM — Phased Implementation Plan
 
-Build **slidenoteLM**, a standalone, local-first web app that turns one lecture recording (audio or video) and its slide PDF into one information-dense English Markdown file optimized for uploading into **NotebookLM**.
+Build **slidenoteLM**, a standalone, local-first web app that turns one lecture recording (audio or video) and its slide PDF into one English Markdown source preserving what a student could learn from the lecture recording and slide deck together for uploading into **NotebookLM**.
 
 Reference repo (read-only inspiration; **copy and simplify**, never import at runtime): `C:\Users\lukas\code\TeachersNote`.
 
@@ -12,7 +12,7 @@ Reference repo (read-only inspiration; **copy and simplify**, never import at ru
 - **Standalone & cross-platform:** Local-first on Windows and Mac using **SQLite + local filesystem** job storage (no Postgres, Redis, or Supabase).
 - **Inputs (v1):** One slide PDF + one audio or video file (audio extracted/normalized via `ffmpeg`).
 - **Output language:** English.
-- **Primary reader:** **NotebookLM (AI retrieval & Q&A)**, not human-polished textbook prose. Optimize for factual completeness, explicitness, self-contained chunks, and zero ambiguity over stylistic flow.
+- **Primary deliverable & consumer:** One English Markdown source uploaded into **NotebookLM** that preserves what a student could learn from the lecture recording and slide deck together. NotebookLM handles source partitioning, retrieval, and generated study aids after upload, so optimize for source fidelity, factual completeness, explicit attribution where it matters, resolved deictic/visual references when supported by the slides, and natural structure rather than artificial self-contained chunks or repetitive boilerplate.
 - **Fixed providers:**
   - **Transcription:** Groq Whisper (chunked/parallelized as needed).
   - **Slide extraction:** Google Gemini OCR **only** (capturing visible text, visual/diagram context, tables, code, and formulas). **Never fall back to `pdfplumber`.** If Gemini OCR fails or credentials are missing, fail clearly at the OCR stage with actionable next steps.
@@ -44,8 +44,8 @@ slidenoteLM/
 │   │       ├── transcribe.py    # Groq Whisper chunked transcription
 │   │       ├── ocr.py           # Google Gemini structured slide OCR (no pdfplumber)
 │   │       ├── align.py         # Alignment contract, quality checks, stub hook (LLM in Phase 6)
-│   │       ├── notes.py         # Sectioning, context carry-over, AI-first prompts, coverage-check contract, stub hook (LLM in Phase 6)
-│   │       └── prompts.py       # English NotebookLM-optimized prompt templates
+│   │       ├── notes.py         # Sectioning, context carry-over, lecture-source prompts, coverage-check contract, stub hook (LLM in Phase 6)
+│   │       └── prompts.py       # English lecture-source Markdown prompt templates for NotebookLM
 │   └── tests/                   # unittest test suite
 └── frontend/
     ├── package.json
@@ -117,7 +117,7 @@ slidenoteLM/
   - Provide a clean hook (`align_with_llm(...)`) plus a deterministic stub mode (`PIPELINE_LLM_MODE=stub`) for end-to-end testing.
 - [x] Implement `backend/app/pipeline/prompts.py` and `backend/app/pipeline/notes.py`:
   - Implement section chunking (grouping contiguous aligned slides/transcript segments into manageable sections, plus explicit off-slide/demo/Q&A spans) and rolling context carry-over across section boundaries.
-  - Encode the full **AI-first NotebookLM Markdown Specification** (see below) in `prompts.py`, plus a **transcript coverage-check** prompt/contract to catch silently dropped explanations or Q&A.
+  - Encode the full **Lecture Source Markdown Specification** (see below) in `prompts.py` (`AI_FIRST_MARKDOWN_RULES`), plus a **transcript coverage-check** prompt/contract to catch silently dropped explanations, lost meaning, or Q&A.
   - Provide a clean single hook (`generate_section_notes_with_llm(...)` + `check_coverage_with_llm(...)`) and deterministic stub mode that emits valid, structured `notes.md` from `slides_ocr.json` + `transcript.json`.
 - [x] Add unit tests for sectioning, boundary context handoff, uncertainty fallback (timestamp-only), and Markdown assembly.
 
@@ -147,21 +147,27 @@ slidenoteLM/
 
 ---
 
-## AI-First Markdown Specification (for Phase 4 Prompts & Phase 6 LLM)
+## Lecture Source Markdown Specification (for Phase 4 Prompts & Phase 6 LLM)
 
-The primary consumer of `notes.md` is **NotebookLM (AI retrieval & Q&A)**. Prioritize **completeness, explicitness, retrieval clarity, and zero ambiguity** over literary prose or visual prettiness.
+The deliverable (`notes.md`) is one English Markdown source uploaded to **NotebookLM** that preserves what a student could learn from the lecture recording and slide deck together. NotebookLM handles source partitioning, retrieval, and generated study aids after upload, so `backend/app/pipeline/prompts.py` (`AI_FIRST_MARKDOWN_RULES`, `SECTION_NOTES_SYSTEM_PROMPT`, and `build_section_notes_prompt`) prioritizes **source fidelity, natural structure, and teaching depth** over artificial chunking or repetitive boilerplate.
 
-1. **Length driven by teaching:** No fixed sentence counts or per-slide word quotas. A title slide may take one line; a 12-minute diagram explanation may take dense, detailed multi-part coverage.
-2. **Explicit over stylistic:** Prefer crisp, structured, information-dense statements, step-by-step sequences, and explicit causal links over flowing narrative. Replace ambiguous pronouns ("it", "this", "that method") with explicit concept names so isolated chunks stay unambiguous when retrieved by NotebookLM.
-3. **Preserve reasoning in sequence:** If the teacher walks through three steps and explains why the third fails, record every step, what happened, and why. Never compress a worked example into "the teacher demonstrated a failure."
-4. **Keep substantive spoken content:** Preserve concrete examples, analogies, definitions, exceptions, edge cases, corrections, and substantive student Q&A with answers. Strip spoken filler, false starts, operational chatter, and empty repetition while keeping any new nuance a second explanation adds.
-5. **Connect speech to visuals:** Use Gemini OCR `VISUAL_CONTEXT` so references like "this arrow" or "the second curve" identify the specific visual element when supported by the slide and recording. Explicitly note uncertainty when ambiguous.
-6. **Accurate exam/study guidance:** Tag exam hints only when the lecturer explicitly says so. Time spent on a topic alone is never evidence that it will be assessed.
-7. **Strict grounding:** Preserve technical terms, equations, numbers, units, code, and qualifications verbatim/accurately. Never invent missing steps, silently resolve contradictions, or present a paraphrase as a direct quote.
-8. **Chunk-friendly Markdown structure:**
-   - Lecture title + descriptive topic headings naming the concrete concept explained.
-   - Slide numbers and `[MM:SS–MM:SS]` timestamps where available; let topics span multiple slides when the explanation does.
-   - Dedicated timestamped sections for substantive off-slide discussion, live demos, and student Q&A.
-   - Distinguish slide content vs. spoken-only additions where helpful for grounding.
-   - When slide alignment is uncertain (unresolved alignment warnings or out-of-order jumps), use the timestamp alone instead of forcing a dubious slide number.
-9. **Long-lecture reliability:** Process in manageable sections, carry rolling context across section boundaries so multi-slide examples stay coherent, and run a transcript coverage check so substantive explanations or Q&A are not silently dropped.
+1. **Length driven by teaching:** No fixed sentence counts, bullet caps, or per-slide word quotas. Let the depth of the teaching determine length: a title or transition slide may take one concise line, whereas a 12-minute diagram walkthrough or derivation requires detailed, multi-part coverage.
+2. **Clear exposition and resolved references:** Write clear, direct, information-dense English with explicit causal links rather than padded narrative. Resolve deictic and visual references ("this arrow", "that curve", "here", "the box on the right") to the concrete concept or visual element when the slide or surrounding explanation establishes their meaning, and note uncertainty when the intended target is ambiguous. Do not force every paragraph to repeat concept names or stand as an isolated self-contained chunk.
+3. **Preserve reasoning chains in sequence:** Record multi-step derivations, proofs, debugging walkthroughs, and worked explanations in exact logical sequence, including steps that cross slide boundaries. If the lecturer walks through three steps and explains why the third step fails, capture every step, what happened, and why it failed. Never compress a worked example into a vague summary such as "the lecturer demonstrated a failure."
+4. **Substantive spoken content and attribution:** Preserve every substantive spoken explanation: mechanisms, concrete examples, analogies, definitions, exceptions, edge cases, caveats, and substantive student Q&A together with the lecturer's answers. Strip only spoken filler, false starts, operational chatter, and empty repetition while retaining any new nuance or clarification added by a second explanation. Integrate slide content, visuals, and speech together rather than splitting them into separate blocks for every topic; identify the source explicitly whenever attribution matters—such as when a claim appears only on the slide, a student proposes an interpretation, or speech conflicts with a diagram—and preserve who asked, asserted, corrected, or speculated whenever that distinction affects meaning.
+5. **Connect speech to visuals by what they teach:** Use Gemini OCR `VISUAL_CONTEXT` (together with `VISIBLE_TEXT` and `TABLES_CODE_FORMULAS`) to ground spoken references to figures, curves, arrows, tables, or diagrams when supported by the slide and recording, and explicitly note uncertainty when ambiguous or unconfirmed. Choose the Markdown representation by what the visual teaches: prose to capture a relationship, a Markdown table to preserve values and units, a numbered sequence to explain a flow or process, and an ASCII or Mermaid diagram only when the supplied evidence establishes its connections and a drawing conveys them more clearly.
+6. **Assessment cues and scope boundaries:** Keep explicit assessment requirements, exam hints, and explicit scope limits (what is in scope, out of scope, or not required to memorize) beside the relevant concept with a `[MM:SS–MM:SS]` timestamp rather than moving them into a separate checklist. Preserve the lecturer's level of certainty accurately: "important to understand" alone is a study cue, and "probably on the exam" carries a different commitment from "will be on the exam." Time spent on a topic alone is never evidence that it will be assessed.
+7. **Strict grounding, discrepancies, and self-corrections:** Preserve technical terms, formulas, source-supplied variable definitions, symbols, numbers, units, code snippets, and qualifications accurately. Never invent missing logical steps, never present a paraphrase as a direct quotation, and omit unknown metadata (use only source-supported course details). Apply a meaning-based rule to ASR discrepancies and self-corrections: use the slide's spelling for an obvious transcription error when the intended term is clear; retain any self-correction that changes the explanation; and when two plausible readings or a conflict between speech and a slide or diagram would teach different things, identify what the transcript and slide each support and leave the uncertainty visible, adding a short discrepancy note only when a reader needs it to interpret the teaching.
+8. **Natural topic headings and source anchors:**
+   - Use descriptive natural topic headings naming the concrete concept explained, with confirmed slide references (`Slide N` / `Slides A–B`) and `[MM:SS–MM:SS]` timestamps.
+   - Let topics span multiple slides when several slides support one argument, and let substantive off-slide discussion, live demos, and student Q&A stand on their `[MM:SS–MM:SS]` timestamp.
+   - Whenever slide alignment is uncertain (unresolved alignment warnings, out-of-order jumps, or unaligned spans), use the `[MM:SS–MM:SS]` timestamp alone instead of forcing a dubious slide number.
+   - Do not repeat full heading hierarchies or fill out empty categories or fixed per-slide blocks.
+   - Leave generated study aids (such as a formula glossary or exam checklist) to NotebookLM: keep formulas, source-supplied variable definitions, and assessment guidance where they were taught, and preserve a concluding recap only if the lecturer or deck actually provides one.
+9. **Long-lecture continuity and reliability:** Process in manageable sections through `notes.py`, carry rolling context and immediate prior boundary transcript overlap across section boundaries so explanations crossing slide or section boundaries remain coherent without repeating already-documented material, and run a transcript coverage check so substantive explanations, steps, qualifications, attribution, scope limits, corrections, or student Q&A are not silently lost.
+
+### Transcript Coverage Check (`COVERAGE_CHECK_SYSTEM_PROMPT` / `build_coverage_check_prompt`)
+
+- Audits each section's chronological transcript against the generated Markdown to catch silently dropped substantive content or loss of meaning.
+- Treats a missing step, a lost qualification, a change from tentative to definite, missing meaningful attribution (who asked, asserted, corrected, or speculated), omitted assessment cues/scope limits/certainty levels/timestamps, or omitted explanation-changing self-corrections or substantive slide/speech discrepancies as a loss of meaning.
+- Does **not** flag a clearly explained point that appears once in integrated form even when supported by both slide and speech, obvious ASR transcription typos normalized to the clear slide spelling, spoken filler/operational chatter/empty repetition, or omitted generated study aids and unknown metadata.
