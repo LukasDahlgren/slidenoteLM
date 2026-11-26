@@ -8,7 +8,6 @@ from typing import Any, Literal, Sequence
 from ..schemas import SlidesOCRArtifact, TranscriptArtifact
 
 SectionKind = Literal["aligned", "off_slide", "uncertain"]
-CoverageSeverity = Literal["warning", "error"]
 
 
 @dataclass(frozen=True)
@@ -147,8 +146,7 @@ AI_FIRST_MARKDOWN_RULES: tuple[PromptSpecRule, ...] = (
             "explanations crossing slide or section boundaries remain coherent without "
             "repeating already-documented material. Preserve every substantive "
             "explanation, step, qualification, certainty level, attribution, scope limit, "
-            "correction, and student Q&A so downstream transcript coverage checks find no "
-            "loss of meaning."
+            "correction, and student Q&A."
         ),
     ),
 )
@@ -181,32 +179,6 @@ ALIGNMENT_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
         }
     },
     "required": ["entries"],
-}
-
-COVERAGE_CHECK_RESPONSE_JSON_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "passed": {"type": "boolean"},
-        "covered_segment_count": {"type": "integer"},
-        "total_segment_count": {"type": "integer"},
-        "missing_items": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "category": {"type": "string"},
-                    "start_time": {"type": ["number", "null"]},
-                    "end_time": {"type": ["number", "null"]},
-                    "segment_indices": {"type": "array", "items": {"type": "integer"}},
-                    "summary": {"type": "string"},
-                    "severity": {"type": "string", "enum": ["warning", "error"]},
-                },
-                "required": ["category", "summary", "severity"],
-            },
-        },
-        "notes": {"type": "string"},
-    },
-    "required": ["passed", "covered_segment_count", "total_segment_count", "missing_items", "notes"],
 }
 
 ALIGNMENT_SYSTEM_PROMPT: str = (
@@ -271,61 +243,6 @@ SECTION_NOTES_SYSTEM_PROMPT: str = (
     "- Do NOT cap bullet counts, do NOT truncate off-slide discussion, and do NOT omit "
     "spoken-only nuance, worked-example steps, qualifications, certainty levels, scope "
     "limits, explanation-changing self-corrections, or student Q&A."
-)
-
-
-COVERAGE_CHECK_SYSTEM_PROMPT: str = (
-    "You are a strict transcript coverage auditor for a lecture Markdown source export.\n"
-    "Your job is to compare one lecture section's chronological transcript against the "
-    "generated Markdown notes for that section and detect any **silently dropped "
-    "substantive content or loss of meaning**.\n\n"
-    "What counts as substantive or a loss of meaning (MUST be captured accurately in the notes):\n"
-    "- Concept definitions, explanations, causal links, and reasoning chains—every step "
-    "in sequence and why a step succeeds or fails; a missing step is a loss of meaning.\n"
-    "- Worked examples, analogies, edge cases, exceptions, caveats, qualifications, and "
-    "numerical/code/formula details; a lost qualification or a change from tentative to "
-    "definite is a loss of meaning.\n"
-    "- Meaningful attribution when it affects what is taught: who asked, asserted, "
-    "corrected, or speculated (such as a student proposing an interpretation and how the "
-    "lecturer responded, including any uncertainty).\n"
-    "- Explanation-changing self-corrections and substantive discrepancies or conflicts "
-    "between spoken speech and slide content/diagrams (where two plausible readings would "
-    "teach different things).\n"
-    "- Visual explanations referencing slide diagrams, curves, arrows, tables, or formulas "
-    "(and preserving visible uncertainty when the referenced target is unclear).\n"
-    "- Explicit assessment cues, assignment requirements, exam hints, and scope limits "
-    "(what is in or out of scope), including their preserved level of certainty (for "
-    "example, 'important to understand' vs. 'probably on the exam' vs. 'will be on the "
-    "exam') and timestamps.\n\n"
-    "What is NOT a coverage gap (ignore these):\n"
-    "- A clearly explained point that appears once in integrated prose/structure even when "
-    "it is supported by both slide and speech (do not require separate slide vs. speech "
-    "repetition).\n"
-    "- Obvious ASR transcription typos normalized to the clear slide spelling when the "
-    "intended term is unambiguous.\n"
-    "- Spoken filler ('um', 'uh', 'you know'), false starts, and verbal stumbles.\n"
-    "- Operational/logistical chatter (audio checks, breaks, seating, file-sharing logistics).\n"
-    "- Pure empty repetition that adds no new detail or nuance.\n"
-    "- Omitted generated study aids (formula glossaries or exam checklists) or omitted "
-    "unspoken/unknown metadata.\n\n"
-    "Return ONLY valid JSON matching this exact schema:\n"
-    "{\n"
-    '  "passed": true | false,\n'
-    '  "covered_segment_count": <int>,\n'
-    '  "total_segment_count": <int>,\n'
-    '  "missing_items": [\n'
-    "    {\n"
-    '      "category": "explanation" | "worked_example" | "student_qa" | "definition" | '
-    '"correction" | "visual_reference" | "exam_guidance" | "other",\n'
-    '      "start_time": <float seconds or null>,\n'
-    '      "end_time": <float seconds or null>,\n'
-    '      "segment_indices": [<int>, ...],\n'
-    '      "summary": "<concise explicit description of what was omitted or altered in meaning>",\n'
-    '      "severity": "warning" | "error"\n'
-    "    }\n"
-    "  ],\n"
-    '  "notes": "<brief audit summary>"\n'
-    "}"
 )
 
 
@@ -450,55 +367,6 @@ class SectionPromptInput:
     uncertainty_reasons: tuple[str, ...] = ()
     lecture_outline: tuple[str, ...] = ()
     prior_boundary_segments: tuple[SectionPromptSegment, ...] = ()
-
-
-@dataclass(frozen=True)
-class CoverageGap:
-    """Single omitted substantive item identified by the transcript coverage check."""
-
-    category: str
-    summary: str
-    start_time: float | None = None
-    end_time: float | None = None
-    segment_indices: tuple[int, ...] = ()
-    severity: CoverageSeverity = "warning"
-
-    def format_warning(self) -> str:
-        ts_prefix = ""
-        if self.start_time is not None:
-            end_val = self.end_time if self.end_time is not None else self.start_time
-            ts_prefix = f"{format_timestamp_range(self.start_time, end_val)} "
-        return f"Coverage gap ({self.category}): {ts_prefix}{self.summary}".strip()
-
-
-@dataclass(frozen=True)
-class CoverageCheckInput:
-    """Structured input contract for checking transcript coverage of generated notes."""
-
-    lecture_title: str
-    section_index: int
-    total_sections: int
-    section_kind: SectionKind
-    start_time: float
-    end_time: float
-    segments: tuple[SectionPromptSegment, ...]
-    generated_markdown: str
-    slide_numbers: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
-class CoverageCheckResult:
-    """Structured result returned by the transcript coverage checker."""
-
-    passed: bool
-    checked_sections: int = 1
-    covered_segment_count: int = 0
-    total_segment_count: int = 0
-    missing_items: tuple[CoverageGap, ...] = ()
-    notes: str = ""
-
-    def to_warnings(self) -> list[str]:
-        return [gap.format_warning() for gap in self.missing_items]
 
 
 def _format_slide_range_label(slide_numbers: tuple[int, ...]) -> str:
@@ -626,52 +494,6 @@ def build_section_notes_prompt(payload: SectionPromptInput) -> PromptMessages:
     )
 
 
-def build_coverage_check_prompt(payload: CoverageCheckInput) -> PromptMessages:
-    """Build the system + user prompts to verify no substantive spoken content or meaning was lost."""
-    ts_range = format_timestamp_range(payload.start_time, payload.end_time)
-    anchor_desc = (
-        f"{_format_slide_range_label(payload.slide_numbers)} {ts_range}"
-        if payload.section_kind == "aligned" and payload.slide_numbers
-        else ts_range
-    )
-
-    lines: list[str] = [
-        f"Lecture Title: {payload.lecture_title}",
-        f"Section: {payload.section_index} of {payload.total_sections} ({payload.section_kind})",
-        f"Anchor: {anchor_desc}",
-        "",
-        "### Source Transcript Segments",
-    ]
-    if payload.segments:
-        for seg in payload.segments:
-            seg_range = format_timestamp_range(seg.start, seg.end)
-            lines.append(f"- {seg_range} (seg {seg.index}): {seg.text.strip()}")
-    else:
-        lines.append("(No transcript segments in this section.)")
-
-    lines.extend(
-        [
-            "",
-            "### Generated Markdown Notes To Audit",
-            payload.generated_markdown.strip() or "(empty)",
-            "",
-            "Audit every substantive explanation, reasoning-chain step, worked example, "
-            "definition, qualification, exception, explanation-changing self-correction or "
-            "discrepancy, visual reference, explicit assessment cue or scope limit (with "
-            "certainty level), and attributed student Q&A in the transcript against the "
-            "generated Markdown. Flag any missing step, lost qualification, or shift from "
-            "tentative to definite as a loss of meaning, while accepting a single clear "
-            "integrated explanation even when supported by both slide and speech. Return "
-            "ONLY the required JSON object.",
-        ]
-    )
-
-    return PromptMessages(
-        system=COVERAGE_CHECK_SYSTEM_PROMPT,
-        user="\n".join(lines),
-    )
-
-
 def _strip_json_code_fence(raw_text: str) -> str:
     cleaned = raw_text.strip()
     fence_match = re.match(
@@ -767,95 +589,10 @@ def parse_alignment_response(raw_response: str | dict[str, Any] | Sequence[Any])
     return list(entries_raw)
 
 
-def parse_coverage_check_response(
-    raw_response: str | dict[str, Any],
-    *,
-    total_segment_count: int = 0,
-) -> CoverageCheckResult:
-    """Parse a JSON string or dict returned by a coverage-check LLM into CoverageCheckResult."""
-    if isinstance(raw_response, str):
-        cleaned = _strip_json_code_fence(raw_response)
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Coverage check response is not valid JSON: {exc}") from exc
-    elif isinstance(raw_response, dict):
-        data = raw_response
-    else:
-        raise ValueError(
-            f"Unsupported coverage check response type: {type(raw_response).__name__}"
-        )
-
-    if not isinstance(data, dict):
-        raise ValueError("Coverage check response must decode to a JSON object.")
-
-    raw_missing = data.get("missing_items") or []
-    if not isinstance(raw_missing, list):
-        raise ValueError("Coverage check 'missing_items' field must be a list.")
-
-    gaps: list[CoverageGap] = []
-    for item in raw_missing:
-        if not isinstance(item, dict):
-            continue
-        summary = str(item.get("summary") or "").strip()
-        if not summary:
-            continue
-        category = str(item.get("category") or "other").strip() or "other"
-        raw_severity = str(item.get("severity") or "warning").strip().lower()
-        severity: CoverageSeverity = "error" if raw_severity == "error" else "warning"
-        start_raw = item.get("start_time")
-        end_raw = item.get("end_time")
-        start_time = float(start_raw) if isinstance(start_raw, (int, float)) else None
-        end_time = float(end_raw) if isinstance(end_raw, (int, float)) else None
-        raw_indices = item.get("segment_indices") or []
-        seg_indices = tuple(
-            int(idx) for idx in raw_indices if isinstance(idx, int) and idx >= 0
-        )
-        gaps.append(
-            CoverageGap(
-                category=category,
-                summary=summary,
-                start_time=start_time,
-                end_time=end_time,
-                segment_indices=seg_indices,
-                severity=severity,
-            )
-        )
-
-    try:
-        raw_total = data.get("total_segment_count", total_segment_count)
-        total_count = int(total_segment_count if raw_total is None else raw_total)
-        covered_default = max(0, total_count - len(gaps))
-        raw_covered = data.get("covered_segment_count", covered_default)
-        covered_count = int(covered_default if raw_covered is None else raw_covered)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Coverage check segment counts must be integers: {exc}") from exc
-    passed_raw = data.get("passed")
-    passed = bool(passed_raw) if isinstance(passed_raw, bool) else (len(gaps) == 0)
-    if gaps:
-        passed = False
-    notes = str(data.get("notes") or "").strip()
-
-    return CoverageCheckResult(
-        passed=passed,
-        checked_sections=1,
-        covered_segment_count=max(0, covered_count),
-        total_segment_count=max(0, total_count),
-        missing_items=tuple(gaps),
-        notes=notes,
-    )
-
-
 __all__ = [
     "AI_FIRST_MARKDOWN_RULES",
     "ALIGNMENT_RESPONSE_JSON_SCHEMA",
     "ALIGNMENT_SYSTEM_PROMPT",
-    "COVERAGE_CHECK_RESPONSE_JSON_SCHEMA",
-    "COVERAGE_CHECK_SYSTEM_PROMPT",
-    "CoverageCheckInput",
-    "CoverageCheckResult",
-    "CoverageGap",
-    "CoverageSeverity",
     "PromptMessages",
     "PromptSpecRule",
     "RollingContext",
@@ -865,10 +602,8 @@ __all__ = [
     "SectionPromptSegment",
     "SectionPromptSlide",
     "build_alignment_prompt",
-    "build_coverage_check_prompt",
     "build_section_notes_prompt",
     "format_timestamp",
     "format_timestamp_range",
     "parse_alignment_response",
-    "parse_coverage_check_response",
 ]

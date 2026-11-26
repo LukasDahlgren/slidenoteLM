@@ -9,8 +9,6 @@ from backend.app.config import Settings
 from backend.app.pipeline.notes import (
     SectionChunkConfig,
     build_lecture_sections,
-    check_coverage_with_llm,
-    check_section_coverage_stub,
     generate_notes,
     generate_section_notes_with_llm,
     load_notes_inputs,
@@ -19,21 +17,15 @@ from backend.app.pipeline.notes import (
 )
 from backend.app.pipeline.prompts import (
     AI_FIRST_MARKDOWN_RULES,
-    COVERAGE_CHECK_SYSTEM_PROMPT,
     SECTION_NOTES_SYSTEM_PROMPT,
-    CoverageCheckInput,
-    CoverageCheckResult,
-    CoverageGap,
     PromptMessages,
     RollingContext,
     SectionPromptInput,
     SectionPromptSegment,
     SectionPromptSlide,
-    build_coverage_check_prompt,
     build_section_notes_prompt,
     format_timestamp,
     format_timestamp_range,
-    parse_coverage_check_response,
 )
 from backend.app.schemas import (
     ARTIFACT_NOTES_MD,
@@ -296,9 +288,9 @@ class TestPromptsSpecification(unittest.TestCase):
         self.assertIn("empty categories or fixed per-slide blocks", prompt)
         self.assertIn("leave generated study aids", prompt)
         self.assertIn("concluding recap only if the lecturer or deck actually provides one", prompt)
-        # Rule 9: rolling context + transcript coverage check
+        # Rule 9: continuity across section boundaries
         self.assertIn("rolling context", prompt)
-        self.assertIn("coverage", prompt)
+        self.assertIn("prior boundary transcript overlap", prompt)
 
     def test_timestamp_formatting_uses_en_dash(self) -> None:
         self.assertEqual(format_timestamp(0.0), "00:00")
@@ -389,66 +381,6 @@ class TestPromptsSpecification(unittest.TestCase):
         off_slide_msgs = build_section_notes_prompt(off_slide_input)
         self.assertIn("OFF-SLIDE / DEMO / Q&A SECTION", off_slide_msgs.user)
         self.assertIn("Do NOT attach or invent any slide number", off_slide_msgs.user)
-
-    def test_coverage_check_prompt_and_response_parser(self) -> None:
-        cov_input = CoverageCheckInput(
-            lecture_title="Raft Consensus",
-            section_index=1,
-            total_sections=1,
-            section_kind="aligned",
-            start_time=0.0,
-            end_time=60.0,
-            slide_numbers=(1,),
-            segments=(
-                SectionPromptSegment(index=0, start=0.0, end=30.0, text="Leader election uses randomized timers.", slide=1),
-                SectionPromptSegment(index=1, start=30.0, end=60.0, text="Student asked about split brain scenarios.", slide=1),
-            ),
-            generated_markdown="## Raft Leader Election (Slide 1) [00:00–01:00]\n- Uses randomized timers.",
-        )
-        msgs = build_coverage_check_prompt(cov_input)
-        self.assertEqual(msgs.system, COVERAGE_CHECK_SYSTEM_PROMPT)
-        self.assertIn("Student asked about split brain scenarios.", msgs.user)
-        cov_system = msgs.system.lower()
-        cov_user = msgs.user.lower()
-        self.assertIn("missing step is a loss of meaning", cov_system)
-        self.assertIn("lost qualification or a change from tentative to definite is a loss of meaning", cov_system)
-        self.assertIn("appears once", cov_system)
-        self.assertIn("supported by both slide and speech", cov_system)
-        self.assertIn("who asked, asserted, corrected, or speculated", cov_system)
-        self.assertIn("scope limits", cov_system)
-        self.assertIn("level of certainty", cov_system)
-        self.assertIn("explanation-changing self-corrections", cov_system)
-        self.assertIn("tentative to definite", cov_user)
-        self.assertIn("supported by both slide and speech", cov_user)
-
-        fenced_json = """```json
-        {
-          "passed": false,
-          "covered_segment_count": 1,
-          "total_segment_count": 2,
-          "missing_items": [
-            {
-              "category": "student_qa",
-              "start_time": 30.0,
-              "end_time": 60.0,
-              "segment_indices": [1],
-              "summary": "Omitted student Q&A about split brain scenarios.",
-              "severity": "warning"
-            }
-          ],
-          "notes": "One student Q&A segment was not covered."
-        }
-        ```"""
-        parsed = parse_coverage_check_response(fenced_json, total_segment_count=2)
-        self.assertFalse(parsed.passed)
-        self.assertEqual(parsed.covered_segment_count, 1)
-        self.assertEqual(parsed.total_segment_count, 2)
-        self.assertEqual(len(parsed.missing_items), 1)
-        self.assertEqual(parsed.missing_items[0].category, "student_qa")
-        self.assertIn("[00:30–01:00]", parsed.to_warnings()[0])
-
-        with self.assertRaises(ValueError):
-            parse_coverage_check_response("not valid json")
 
 
 class TestSectionChunking(unittest.TestCase):
@@ -813,49 +745,6 @@ class TestRollingContextCarryOver(unittest.TestCase):
         self.assertEqual(result.prompt_inputs[3].rolling_context.last_slide, 3)
 
 
-class TestCoverageCheck(unittest.TestCase):
-    def test_stub_coverage_check_detects_missing_substantive_content_and_ignores_filler(self) -> None:
-        cov_input = CoverageCheckInput(
-            lecture_title="Databases",
-            section_index=1,
-            total_sections=1,
-            section_kind="aligned",
-            start_time=0.0,
-            end_time=90.0,
-            slide_numbers=(1,),
-            segments=(
-                SectionPromptSegment(index=0, start=0.0, end=10.0, text="Can everyone hear me? Okay, um, let's begin.", slide=1),
-                SectionPromptSegment(
-                    index=1,
-                    start=10.0,
-                    end=45.0,
-                    text="Write-ahead logging persists redo records sequentially before dirty pages flush to disk.",
-                    slide=1,
-                ),
-                SectionPromptSegment(
-                    index=2,
-                    start=45.0,
-                    end=90.0,
-                    text="Student question: Why does checkpointing bound crash recovery time?",
-                    slide=1,
-                ),
-            ),
-            generated_markdown=(
-                "## Write-Ahead Logging (Slide 1) [00:00–01:30]\n\n"
-                "- Write-ahead logging writes redo records sequentially before dirty pages flush to disk."
-            ),
-        )
-        result = check_section_coverage_stub(cov_input)
-        self.assertFalse(result.passed)
-        # Segment 0 is operational chatter (ignored); segment 1 covered; segment 2 missing!
-        self.assertEqual(result.total_segment_count, 2)
-        self.assertEqual(result.covered_segment_count, 1)
-        self.assertEqual(len(result.missing_items), 1)
-        self.assertEqual(result.missing_items[0].category, "student_qa")
-        self.assertEqual(result.missing_items[0].segment_indices, (2,))
-        self.assertTrue(result.to_warnings())
-
-
 class TestPhase6LLMHooks(unittest.TestCase):
     def test_non_stub_mode_without_callable_raises_actionable_stage_error(self) -> None:
         prompt_input = SectionPromptInput(
@@ -869,18 +758,6 @@ class TestPhase6LLMHooks(unittest.TestCase):
             slides=(SectionPromptSlide(slide=1, visible_text="Lexing"),),
             segments=(SectionPromptSegment(index=0, start=0.0, end=30.0, text="Lexers tokenize source characters.", slide=1),),
         )
-        cov_input = CoverageCheckInput(
-            lecture_title="Compilers",
-            section_index=1,
-            total_sections=1,
-            section_kind="aligned",
-            start_time=0.0,
-            end_time=30.0,
-            segments=prompt_input.segments,
-            generated_markdown="## Lexing (Slide 1) [00:00–00:30]\n- Lexers tokenize source characters.",
-            slide_numbers=(1,),
-        )
-
         with tempfile.TemporaryDirectory() as tmp:
             live_settings = _make_settings(Path(tmp), pipeline_llm_mode="openai")
 
@@ -890,42 +767,11 @@ class TestPhase6LLMHooks(unittest.TestCase):
             self.assertIn("Phase 6", notes_err.exception.hint)
             self.assertIn("PIPELINE_LLM_MODE=stub", notes_err.exception.hint)
 
-            with self.assertRaises(StageError) as cov_err:
-                check_coverage_with_llm(cov_input, live_settings)
-            self.assertEqual(cov_err.exception.stage, "notes")
-            self.assertIn("Phase 6", cov_err.exception.hint)
-
-    def test_injectable_callables_run_in_non_stub_mode_and_surface_coverage_warnings(self) -> None:
+    def test_injected_writer_runs_in_non_stub_mode(self) -> None:
         slides_ocr, transcript, alignment = _sample_lecture_artifacts()
 
         def section_llm(messages: PromptMessages, payload: SectionPromptInput, settings: Settings) -> str:
             return render_section_notes_stub(payload)
-
-        def coverage_llm(messages: PromptMessages, payload: CoverageCheckInput, settings: Settings) -> dict[str, object]:
-            if payload.section_kind == "off_slide":
-                return {
-                    "passed": False,
-                    "covered_segment_count": 0,
-                    "total_segment_count": len(payload.segments),
-                    "missing_items": [
-                        {
-                            "category": "student_qa",
-                            "start_time": payload.start_time,
-                            "end_time": payload.end_time,
-                            "segment_indices": [seg.index for seg in payload.segments],
-                            "summary": "Verify full quorum partition answer is retained.",
-                            "severity": "warning",
-                        }
-                    ],
-                    "notes": "Flagged for verification.",
-                }
-            return {
-                "passed": True,
-                "covered_segment_count": len(payload.segments),
-                "total_segment_count": len(payload.segments),
-                "missing_items": [],
-                "notes": "Complete.",
-            }
 
         with tempfile.TemporaryDirectory() as tmp:
             live_settings = _make_settings(Path(tmp), pipeline_llm_mode="anthropic")
@@ -935,12 +781,9 @@ class TestPhase6LLMHooks(unittest.TestCase):
                 alignment,
                 live_settings,
                 section_llm_callable=section_llm,
-                coverage_llm_callable=coverage_llm,
             )
 
-        self.assertFalse(result.coverage_result.passed)
-        self.assertEqual(len(result.coverage_result.missing_items), 1)
-        self.assertTrue(any("student_qa" in w for w in result.warnings))
+        self.assertIn("Raft", result.markdown)
 
     def test_empty_llm_output_raises_stage_error(self) -> None:
         prompt_input = SectionPromptInput(
@@ -985,7 +828,6 @@ class TestRunNotesStage(unittest.TestCase):
         self.assertEqual(stage_result.stats["aligned_sections"], 2)
         self.assertEqual(stage_result.stats["off_slide_sections"], 1)
         self.assertEqual(stage_result.stats["uncertain_sections"], 1)
-        self.assertTrue(stage_result.stats["coverage_passed"])
         self.assertTrue(progress_log)
         self.assertTrue(any("out_of_order_jump" in w for w in stage_result.warnings))
 

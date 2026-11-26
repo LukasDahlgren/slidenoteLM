@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import shutil
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import AsyncIterator
 
@@ -26,7 +27,6 @@ from .pipeline import StageHandler
 from .ratelimit import RateLimitMiddleware, SlidingWindowRateLimiter
 from .schemas import (
     ARTIFACT_SLIDES_PDF,
-    PIPELINE_STAGES,
     STAGE_LABELS,
     HealthResponse,
     JobCancelRequest,
@@ -67,22 +67,39 @@ def build_download_filename(slides_filename: str) -> str:
     return f"{base}-notes.md"
 
 
-def _compute_progress_pct(job: dict) -> int:
+# Stage durations from the 51-slide benchmark. Upload precedes backend processing.
+_STAGE_SECONDS = {"audio_prep": 17, "transcription": 13, "ocr": 39, "alignment": 74, "notes": 129}
+
+
+def _compute_progress_pct(job: dict, *, now: datetime | None = None) -> int:
     if job["status"] == "completed":
         return 100
-    stages = job.get("stages") or []
-    total = len(PIPELINE_STAGES)
-    if total == 0:
-        return 0
-    score = 0.0
-    for stage in stages:
-        stage_status = stage.get("status")
-        if stage_status == "completed":
-            score += 1.0
-        elif stage_status == "running":
-            score += 0.5
-    pct = int(round((score / total) * 100))
-    return max(0, min(99, pct))
+    now = now or datetime.now(timezone.utc)
+    earned = dict.fromkeys(_STAGE_SECONDS, 0.0)
+    for stage in job.get("stages", []):
+        name = stage["stage"]
+        if name not in _STAGE_SECONDS or stage["status"] == "pending":
+            continue
+        if stage["status"] == "completed":
+            earned[name] = _STAGE_SECONDS[name]
+        elif name == "notes":
+            earned[name] = _STAGE_SECONDS[name] * (stage.get("work_fraction") or 0)
+        elif stage.get("started_at"):
+            # A stopped job can retain a running sibling while its request drains.
+            end = stage.get("completed_at") or job.get("completed_at")
+            end_time = datetime.fromisoformat(end) if end else now
+            if not end and job["status"] != "processing":
+                continue
+            elapsed = (end_time - datetime.fromisoformat(stage["started_at"])).total_seconds()
+            earned[name] = min(max(elapsed, 0), 0.95 * _STAGE_SECONDS[name])
+
+    # Split one preparation window across both branches so their overlap counts only once.
+    audio = _STAGE_SECONDS["audio_prep"] + _STAGE_SECONDS["transcription"]
+    prep_window = max(audio, _STAGE_SECONDS["ocr"])
+    prep_fraction = (earned["audio_prep"] + earned["transcription"] + earned["ocr"]) / (audio + _STAGE_SECONDS["ocr"])
+    total = prep_window + _STAGE_SECONDS["alignment"] + _STAGE_SECONDS["notes"]
+    progress = prep_window * prep_fraction + earned["alignment"] + earned["notes"]
+    return min(99, round(100 * progress / total))
 
 
 def _resolve_notes_path(job: dict) -> Path | None:

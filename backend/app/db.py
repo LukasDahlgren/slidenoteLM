@@ -19,7 +19,7 @@ from .schemas import (
     PipelineStage,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 QUEUE_POSITION_STEP = 1000
 INTERRUPTED_MESSAGE = "Processing was interrupted because the server restarted."
 INTERRUPTED_HINT = "Click Retry to resume from the last completed stage, or upload again."
@@ -160,6 +160,9 @@ class JobStore:
 
     @staticmethod
     def _migrate_schema(conn: sqlite3.Connection) -> None:
+        stage_columns = {row["name"] for row in conn.execute("PRAGMA table_info(job_stages)")}
+        if "work_fraction" not in stage_columns:
+            conn.execute("ALTER TABLE job_stages ADD COLUMN work_fraction REAL")
         columns = {
             str(row["name"]) for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
         }
@@ -321,7 +324,7 @@ class JobStore:
 
         stage_rows = conn.execute(
             """
-            SELECT stage, status, message, started_at, completed_at
+            SELECT stage, status, message, started_at, completed_at, work_fraction
             FROM job_stages
             WHERE job_token = ?
             ORDER BY stage_order ASC
@@ -409,6 +412,14 @@ class JobStore:
             (token,),
         ).fetchone()
         return row["stage"] if row else fallback
+
+    def update_stage_fraction(self, token: str, stage: PipelineStage, fraction: float) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE job_stages SET work_fraction = ?
+                   WHERE job_token = ? AND stage = ? AND status = 'running'""",
+                (fraction, token, stage),
+            )
 
     def update_stage_message(self, token: str, stage: PipelineStage, message: str) -> None:
         """Update the live status message for a running stage."""
@@ -835,6 +846,7 @@ class JobStore:
                         """
                         UPDATE job_stages
                         SET status = 'pending',
+                            work_fraction = NULL,
                             message = NULL,
                             started_at = NULL,
                             completed_at = NULL
@@ -989,7 +1001,7 @@ class JobStore:
                 placeholders = ",".join("?" for _ in all_tokens)
                 stage_rows = conn.execute(
                     f"""
-                    SELECT job_token, stage, status, message, started_at, completed_at
+                    SELECT job_token, stage, status, message, started_at, completed_at, work_fraction
                     FROM job_stages
                     WHERE job_token IN ({placeholders})
                     ORDER BY job_token, stage_order ASC
@@ -1203,6 +1215,7 @@ class JobStore:
                     "message": s["message"],
                     "started_at": s["started_at"],
                     "completed_at": s["completed_at"],
+                    "work_fraction": s["work_fraction"],
                 }
                 for s in stage_rows
             ],

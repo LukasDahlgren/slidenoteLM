@@ -32,7 +32,6 @@ from backend.app.pipeline.gemini_client import (
 )
 from backend.app.pipeline.notes import (
     _unwrap_outer_markdown_fence,
-    check_coverage_with_llm,
     generate_notes,
     generate_section_notes_with_llm,
     run_notes_stage,
@@ -40,12 +39,8 @@ from backend.app.pipeline.notes import (
 from backend.app.pipeline.ocr import extract_slides_with_gemini_ocr
 from backend.app.pipeline.prompts import (
     ALIGNMENT_RESPONSE_JSON_SCHEMA,
-    COVERAGE_CHECK_RESPONSE_JSON_SCHEMA,
-    CoverageCheckInput,
-    SectionPromptSegment,
     build_alignment_prompt,
     parse_alignment_response,
-    parse_coverage_check_response,
 )
 from backend.app.ratelimit import OutboundRateLimiter
 from backend.app.schemas import (
@@ -209,8 +204,6 @@ class TestPhase6GeminiConfigAndThinking(unittest.TestCase):
         self.assertEqual(cfg.llm_align_thinking_level, "HIGH")
         self.assertEqual(cfg.llm_notes_model, "gemini-4-neon")
         self.assertEqual(cfg.llm_notes_thinking_level, "HIGH")
-        self.assertEqual(cfg.llm_coverage_model, "gemini-4-neon")
-        self.assertEqual(cfg.llm_coverage_thinking_level, "MEDIUM")
         self.assertEqual(cfg.llm_retry_attempts, 4)
 
     def test_load_settings_parses_custom_thinking_levels_off_and_default(self) -> None:
@@ -221,7 +214,6 @@ class TestPhase6GeminiConfigAndThinking(unittest.TestCase):
                 "OCR_THINKING_LEVEL": "off",
                 "LLM_ALIGN_THINKING_LEVEL": "xhigh",
                 "LLM_NOTES_THINKING_LEVEL": "medium",
-                "LLM_COVERAGE_THINKING_LEVEL": "default",
             }
             with mock.patch.dict(os.environ, env_patch, clear=False):
                 cfg = load_settings(env_file=Path(tmp) / "missing.env")
@@ -231,7 +223,6 @@ class TestPhase6GeminiConfigAndThinking(unittest.TestCase):
         self.assertEqual(cfg.ocr_thinking_level, "MINIMAL")
         self.assertEqual(cfg.llm_align_thinking_level, "XHIGH")
         self.assertEqual(cfg.llm_notes_thinking_level, "MEDIUM")
-        self.assertEqual(cfg.llm_coverage_thinking_level, "")
 
     def test_supports_thinking_level_and_build_thinking_config(self) -> None:
         self.assertTrue(supports_thinking_level("gemini-4-neon"))
@@ -700,7 +691,7 @@ class TestPhase6GeminiAlignment(unittest.TestCase):
         self.assertEqual(len(persisted.entries), 2)
 
 
-class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
+class TestPhase6GeminiNotes(unittest.TestCase):
     def test_unwrap_outer_markdown_fence_edge_cases(self) -> None:
         # Labeled markdown fence wrapping inner python code block -> unwrap cleanly.
         wrapped = (
@@ -730,17 +721,10 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
         comment_blocks = "```\n# comment\nprint(1)\n```\n\nText\n\n```\nprint(2)\n```"
         self.assertEqual(_unwrap_outer_markdown_fence(comment_blocks), comment_blocks)
 
-    def test_parse_coverage_check_response_raises_value_error_on_bad_int_type(self) -> None:
-        with self.assertRaises(ValueError):
-            parse_coverage_check_response(
-                {"passed": True, "total_segment_count": {"bad": 1}, "missing_items": []}
-            )
-
-    def test_generate_notes_uses_high_medium_schemas_reuses_client_and_degrades_audit_gracefully(self) -> None:
+    def test_generate_notes_reuses_one_client_and_calls_gemini_once_per_section(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = _make_settings(
                 Path(tmp), llm_retry_attempts=2, llm_notes_parallel_workers=1,
-                notes_min_audit_transcript_chars=0,
             )
             slides = _sample_slides()
             transcript = _sample_transcript()
@@ -773,25 +757,11 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
                         "- Sigmoid derivatives peak at 0.25, causing gradients to shrink across layers.\n"
                         "```"
                     ),
-                    # Section 1 coverage audit: malformed JSON on attempt 1, valid on attempt 2
-                    "{broken json",
-                    json.dumps(
-                        {
-                            "passed": True,
-                            "covered_segment_count": 2,
-                            "total_segment_count": 2,
-                            "missing_items": [],
-                            "notes": "All substantive steps covered.",
-                        }
-                    ),
                     # Section 2 (off-slide Q&A) notes
                     (
                         "## Student Q&A: ReLU and Dying ReLU [00:45–01:15]\n\n"
                         "- ReLU avoids sigmoid saturation for positive inputs, but negative inputs can cause dying ReLU.\n"
                     ),
-                    # Section 2 coverage audit fails both attempts -> must NOT discard generated notes!
-                    "{still broken 1",
-                    "{still broken 2",
                 ]
             )
             factory_calls = 0
@@ -810,31 +780,18 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
             )
 
         self.assertEqual(factory_calls, 1)
-        self.assertEqual(len(fake_client.calls), 6)
+        self.assertEqual(len(fake_client.calls), 2)
 
         notes_call_1 = fake_client.calls[0]
-        cov_call_1 = fake_client.calls[1]
         self.assertEqual(notes_call_1["model"], "gemini-4-neon")
         self.assertEqual(notes_call_1["config"].thinking_config.thinking_level, types.ThinkingLevel.HIGH)
         self.assertIsNone(notes_call_1["config"].response_mime_type)
 
-        self.assertEqual(cov_call_1["model"], "gemini-4-neon")
-        self.assertEqual(cov_call_1["config"].thinking_config.thinking_level, types.ThinkingLevel.MEDIUM)
-        self.assertEqual(cov_call_1["config"].response_mime_type, "application/json")
-        self.assertEqual(
-            cov_call_1["config"].response_json_schema,
-            COVERAGE_CHECK_RESPONSE_JSON_SCHEMA,
-        )
-
-        # Notes preserved even though section 2 coverage audit failed!
         self.assertIn("- **Notes Mode:** `gemini`", result.markdown)
         self.assertNotIn("```markdown", result.markdown)
         self.assertIn("## Backpropagation and Vanishing Gradients", result.markdown)
         self.assertIn("## Student Q&A: ReLU and Dying ReLU", result.markdown)
-        self.assertFalse(result.coverage_result.passed)
-        self.assertTrue(any("Coverage audit unavailable" in w for w in result.warnings))
         self.assertEqual(result.notes_input_tokens, 2400)
-        self.assertEqual(result.coverage_input_tokens, 1200)
 
     def test_generate_notes_closes_internally_created_client(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -852,15 +809,6 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
             internal_client = _FakeTextClient(
                 [
                     "## Backprop (Slide 1) [00:00–01:15]\n\n- Notes body.",
-                    json.dumps(
-                        {
-                            "passed": True,
-                            "covered_segment_count": 3,
-                            "total_segment_count": 3,
-                            "missing_items": [],
-                            "notes": "Ok.",
-                        }
-                    ),
                 ]
             )
             with mock.patch(
@@ -869,30 +817,6 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
             ):
                 generate_notes(slides, transcript, alignment, settings)
             self.assertTrue(internal_client.closed)
-
-    def test_direct_coverage_check_raises_stage_error_on_repeated_malformed_json(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            settings = _make_settings(Path(tmp), pipeline_llm_mode="gemini", llm_retry_attempts=2)
-            cov_input = CoverageCheckInput(
-                lecture_title="Test",
-                section_index=1,
-                total_sections=1,
-                section_kind="aligned",
-                start_time=0.0,
-                end_time=20.0,
-                segments=(SectionPromptSegment(index=0, start=0.0, end=20.0, text="Hello"),),
-                generated_markdown="## Intro\n- Hello",
-                slide_numbers=(1,),
-            )
-            bad_client = _FakeTextClient(["not json 1", "not json 2"])
-            with self.assertRaises(StageError) as ctx:
-                check_coverage_with_llm(
-                    cov_input,
-                    settings,
-                    client_factory=lambda _s: bad_client,
-                )
-            self.assertEqual(ctx.exception.stage, "notes")
-            self.assertEqual(len(bad_client.calls), 2)
 
     def test_run_notes_stage_writes_markdown_and_surfaces_token_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -915,15 +839,6 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
             fake_client = _FakeTextClient(
                 [
                     "## Backpropagation (Slide 1) [00:00–01:15]\n\n- Detailed chain rule explanation.",
-                    json.dumps(
-                        {
-                            "passed": True,
-                            "covered_segment_count": 3,
-                            "total_segment_count": 3,
-                            "missing_items": [],
-                            "notes": "Complete.",
-                        }
-                    ),
                 ]
             )
 
@@ -932,11 +847,9 @@ class TestPhase6GeminiNotesAndCoverage(unittest.TestCase):
             )
             written = ctx.notes_path.read_text(encoding="utf-8")
 
-        self.assertTrue(stage_result.stats["coverage_passed"])
         self.assertEqual(stage_result.stats["notes_input_tokens"], 1200)
         self.assertEqual(stage_result.stats["notes_output_tokens"], 400)
         self.assertEqual(stage_result.stats["notes_thinking_tokens"], 250)
-        self.assertEqual(stage_result.stats["coverage_input_tokens"], 1200)
         self.assertIn("Detailed chain rule explanation.", written)
 
     def test_call_gemini_text_fails_fast_on_401_and_retries_429(self) -> None:

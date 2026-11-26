@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -22,7 +23,7 @@ from backend.app.db import (
     JobStore,
     generate_job_token,
 )
-from backend.app.main import build_download_filename, create_app
+from backend.app.main import _compute_progress_pct, build_download_filename, create_app
 from backend.app.pipeline import StageHandler
 from backend.app.pipeline.audio import FFmpegBinaries
 from backend.app.schemas import (
@@ -115,6 +116,30 @@ def _build_pdf_bytes(page_texts: list[str]) -> bytes:
 
 
 class Phase1BackendTests(unittest.TestCase):
+    def test_progress_uses_overlapping_prep_time_and_completed_note_work(self) -> None:
+        now = datetime(2026, 11, 26, 12, 0, 37, tzinfo=timezone.utc)
+        stages = [{"stage": "upload", "status": "completed"}]
+        job = {"status": "queued", "stages": stages}
+        self.assertEqual(_compute_progress_pct(job, now=now), 0)
+        job["status"] = "processing"
+        stages.extend({"stage": name, "status": "completed"} for name in ("audio_prep", "transcription", "ocr"))
+        self.assertEqual(_compute_progress_pct(job, now=now), 16)
+
+        stages.append({"stage": "alignment", "status": "running", "started_at": "2026-11-26T12:00:00+00:00"})
+        self.assertEqual(_compute_progress_pct(job, now=now), 31)
+        job.update(status="cancelled", completed_at="2026-11-26T12:00:37+00:00")
+        self.assertEqual(_compute_progress_pct(job, now=now.replace(hour=13)), 31)
+        job.update(status="processing", completed_at=None)
+        stages[-1]["status"] = "completed"
+        stages.append({"stage": "notes", "status": "running"})
+        self.assertEqual(_compute_progress_pct(job, now=now), 47)
+        stages[-1]["work_fraction"] = 0.5
+        self.assertEqual(_compute_progress_pct(job, now=now), 73)
+        stages[-1]["work_fraction"] = 1.0
+        self.assertEqual(_compute_progress_pct(job, now=now), 99)
+        job["status"] = "completed"
+        self.assertEqual(_compute_progress_pct(job, now=now), 100)
+
     def setUp(self) -> None:
         self.tmp_dir = Path(tempfile.mkdtemp(prefix="slidenotelm-p1-"))
 

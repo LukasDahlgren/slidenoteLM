@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,16 +12,11 @@ from pydantic import ValidationError
 
 from ..config import (
     DEFAULT_LLM_NOTES_PARALLEL_WORKERS,
-    DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS,
     DEFAULT_NOTES_MAX_SLIDES_PER_SECTION,
     DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS,
     DEFAULT_NOTES_MAX_SECTION_TRANSCRIPT_CHARS,
     DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_SECONDS,
     DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_CHARS,
-    DEFAULT_NOTES_MIN_AUDIT_TRANSCRIPT_CHARS,
-    DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS,
-    DEFAULT_LLM_COVERAGE_MODEL,
-    DEFAULT_LLM_COVERAGE_THINKING_LEVEL,
     DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS,
     DEFAULT_LLM_NOTES_MODEL,
     DEFAULT_LLM_NOTES_THINKING_LEVEL,
@@ -52,24 +46,16 @@ from .gemini_client import (
     validate_gemini_credentials,
 )
 from .prompts import (
-    COVERAGE_CHECK_RESPONSE_JSON_SCHEMA,
-    CoverageCheckInput,
-    CoverageCheckResult,
-    CoverageGap,
     PromptMessages,
     RollingContext,
     SectionKind,
     SectionPromptInput,
     SectionPromptSegment,
     SectionPromptSlide,
-    build_coverage_check_prompt,
     build_section_notes_prompt,
     format_timestamp,
     format_timestamp_range,
-    parse_coverage_check_response,
 )
-
-logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_SLIDES_PER_SECTION = DEFAULT_NOTES_MAX_SLIDES_PER_SECTION
 DEFAULT_MAX_SECTION_DURATION_SECONDS = DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS
@@ -78,10 +64,6 @@ DEFAULT_INLINE_OFF_SLIDE_MAX_SECONDS = DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_SECOND
 DEFAULT_INLINE_OFF_SLIDE_MAX_CHARS = DEFAULT_NOTES_INLINE_OFF_SLIDE_MAX_CHARS
 
 SectionNotesLLMCallable = Callable[[PromptMessages, SectionPromptInput, Settings], str]
-CoverageCheckLLMCallable = Callable[
-    [PromptMessages, CoverageCheckInput, Settings],
-    CoverageCheckResult | dict[str, Any] | str,
-]
 
 # Issue codes that describe global/informational deck conditions rather than making an
 # already-aligned slide's placement dubious.
@@ -101,116 +83,6 @@ _NON_DUBIOUS_ISSUE_CODES = frozenset(
     }
 )
 
-# Common spoken filler words stripped when checking substantive coverage in stub mode.
-_FILLER_TOKENS = frozenset(
-    {
-        "a",
-        "ah",
-        "all",
-        "am",
-        "an",
-        "and",
-        "are",
-        "as",
-        "at",
-        "be",
-        "been",
-        "being",
-        "but",
-        "by",
-        "can",
-        "do",
-        "does",
-        "er",
-        "for",
-        "from",
-        "go",
-        "going",
-        "got",
-        "had",
-        "has",
-        "have",
-        "he",
-        "her",
-        "here",
-        "him",
-        "his",
-        "hmm",
-        "how",
-        "i",
-        "if",
-        "in",
-        "into",
-        "is",
-        "it",
-        "its",
-        "just",
-        "know",
-        "let",
-        "like",
-        "me",
-        "my",
-        "no",
-        "not",
-        "now",
-        "of",
-        "oh",
-        "ok",
-        "okay",
-        "on",
-        "one",
-        "or",
-        "our",
-        "out",
-        "really",
-        "right",
-        "say",
-        "see",
-        "she",
-        "so",
-        "some",
-        "that",
-        "the",
-        "their",
-        "them",
-        "then",
-        "there",
-        "these",
-        "they",
-        "this",
-        "those",
-        "to",
-        "uh",
-        "um",
-        "up",
-        "us",
-        "very",
-        "was",
-        "we",
-        "well",
-        "were",
-        "what",
-        "when",
-        "which",
-        "who",
-        "will",
-        "with",
-        "would",
-        "yeah",
-        "yes",
-        "you",
-        "your",
-    }
-)
-
-_OPERATIONAL_CHATTER_RE = re.compile(
-    r"^(?:can (?:you|everyone) hear me|testing(?: one two)?|is the mic on|"
-    r"let'?s take a (?:short |quick )?break|we'?ll be right back|"
-    r"welcome back everyone|all right(?: let'?s get started)?|hello everyone)\b",
-    flags=re.IGNORECASE,
-)
-
-_WORD_TOKEN_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./+-]*")
 _CAPITALIZED_TERM_RE = re.compile(r"\b[A-Z][A-Za-z0-9_-]{2,}(?:\s+[A-Z][A-Za-z0-9_-]{2,})?\b")
 _BACKTICK_TERM_RE = re.compile(r"`([^`]{2,48})`")
 _THREAD_SIGNAL_RE = re.compile(
@@ -278,20 +150,16 @@ class LectureSection:
 
 @dataclass(frozen=True)
 class NotesGenerationResult:
-    """Full output of the notes pipeline stage (Markdown + coverage + metadata)."""
+    """Full output of the notes pipeline stage (Markdown and metadata)."""
 
     markdown: str
     sections: tuple[LectureSection, ...]
     prompt_inputs: tuple[SectionPromptInput, ...]
-    coverage_result: CoverageCheckResult
     warnings: tuple[str, ...]
     word_count: int
     notes_input_tokens: int = 0
     notes_output_tokens: int = 0
     notes_thinking_tokens: int = 0
-    coverage_input_tokens: int = 0
-    coverage_output_tokens: int = 0
-    coverage_thinking_tokens: int = 0
 
 
 def _load_json_artifact(
@@ -1073,80 +941,6 @@ def render_section_notes_stub(prompt_input: SectionPromptInput) -> str:
     return "\n".join(lines).strip()
 
 
-def _extract_substantive_tokens(text: str) -> set[str]:
-    tokens: set[str] = set()
-    for raw in _WORD_TOKEN_RE.findall(text.lower()):
-        cleaned = raw.strip(".,;:!?()[]{}'\"")
-        if len(cleaned) < 3:
-            continue
-        if cleaned in _FILLER_TOKENS:
-            continue
-        tokens.add(cleaned)
-    return tokens
-
-
-def _is_substantive_segment(text: str) -> bool:
-    cleaned = " ".join(text.split()).strip()
-    if not cleaned:
-        return False
-    if _OPERATIONAL_CHATTER_RE.match(cleaned) and len(cleaned.split()) <= 10:
-        return False
-    tokens = _extract_substantive_tokens(cleaned)
-    return len(tokens) >= 2
-
-
-def check_section_coverage_stub(payload: CoverageCheckInput) -> CoverageCheckResult:
-    """Deterministic lexical coverage check verifying substantive spoken segments appear in notes."""
-    markdown_tokens = _extract_substantive_tokens(payload.generated_markdown)
-    total_substantive = 0
-    covered_substantive = 0
-    gaps: list[CoverageGap] = []
-
-    for seg in payload.segments:
-        if not _is_substantive_segment(seg.text):
-            continue
-        total_substantive += 1
-        seg_tokens = _extract_substantive_tokens(seg.text)
-        overlap = seg_tokens & markdown_tokens
-        ratio = (len(overlap) / len(seg_tokens)) if seg_tokens else 1.0
-        if ratio >= 0.4 or (len(seg_tokens) <= 3 and len(overlap) >= 1):
-            covered_substantive += 1
-        else:
-            category = "student_qa" if "?" in seg.text else "explanation"
-            snippet = " ".join(seg.text.split())
-            if len(snippet) > 120:
-                snippet = snippet[:117].rstrip() + "..."
-            gaps.append(
-                CoverageGap(
-                    category=category,
-                    summary=f"Transcript segment {seg.index} may be missing from notes: \"{snippet}\"",
-                    start_time=seg.start,
-                    end_time=seg.end,
-                    segment_indices=(seg.index,),
-                    severity="warning",
-                )
-            )
-
-    passed = len(gaps) == 0
-    notes = (
-        f"Deterministic stub coverage check passed ({covered_substantive}/{total_substantive} "
-        "substantive segment(s) covered)."
-        if passed
-        else (
-            f"Deterministic stub coverage check flagged {len(gaps)} potentially missing "
-            f"substantive segment(s) out of {total_substantive}."
-        )
-    )
-    return CoverageCheckResult(
-        passed=passed,
-        checked_sections=1,
-        covered_segment_count=covered_substantive,
-        total_segment_count=total_substantive,
-        missing_items=tuple(gaps),
-        notes=notes,
-    )
-
-
 def _unwrap_outer_markdown_fence(raw_text: str) -> str:
     """Unwrap an outer ```markdown ... ``` fence if the LLM wrapped the entire section."""
     cleaned = (raw_text or "").strip()
@@ -1298,173 +1092,6 @@ def generate_section_notes_with_llm(
         progress_callback=progress_callback,
     )
     return markdown
-
-
-def _check_coverage_with_usage(
-    coverage_input: CoverageCheckInput,
-    settings: Settings,
-    *,
-    llm_callable: CoverageCheckLLMCallable | None = None,
-    client: Any | None = None,
-    client_factory: GenAIClientFactory | None = None,
-    progress_callback: ProgressCallback | None = None,
-    cancel_event: Event | None = None,
-) -> tuple[CoverageCheckResult, GeminiTextResult | None]:
-    prompt_messages = build_coverage_check_prompt(coverage_input)
-
-    if llm_callable is not None:
-        try:
-            raw_result = llm_callable(prompt_messages, coverage_input, settings)
-        except StageError:
-            raise
-        except Exception as exc:
-            raise StageError(
-                stage="notes",
-                message=(
-                    f"LLM transcript coverage check failed on section "
-                    f"{coverage_input.section_index}/{coverage_input.total_sections}: {exc}"
-                ),
-                hint="Verify the configured LLM provider and JSON response format, then retry.",
-            ) from exc
-
-        if isinstance(raw_result, CoverageCheckResult):
-            return raw_result, None
-        try:
-            return (
-                parse_coverage_check_response(
-                    raw_result,
-                    total_segment_count=len(coverage_input.segments),
-                ),
-                None,
-            )
-        except ValueError as exc:
-            raise StageError(
-                stage="notes",
-                message=(
-                    f"Invalid coverage check output on section "
-                    f"{coverage_input.section_index}/{coverage_input.total_sections}: {exc}"
-                ),
-                hint="Ensure the coverage-check LLM returns valid JSON matching the coverage schema.",
-            ) from exc
-
-    mode = (settings.pipeline_llm_mode or "gemini").strip().lower()
-    if mode == "stub":
-        return check_section_coverage_stub(coverage_input), None
-
-    if is_gemini_live_mode(mode):
-        model = (
-            str(getattr(settings, "llm_coverage_model", DEFAULT_LLM_COVERAGE_MODEL) or "").strip()
-            or DEFAULT_LLM_COVERAGE_MODEL
-        )
-        thinking_level = str(
-            getattr(settings, "llm_coverage_thinking_level", DEFAULT_LLM_COVERAGE_THINKING_LEVEL)
-            or ""
-        )
-        max_output_tokens = int(
-            getattr(
-                settings,
-                "llm_coverage_max_output_tokens",
-                DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS,
-            )
-            or DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS
-        )
-        result = call_gemini_text(
-            stage="notes",
-            task_label=(
-                f"coverage audit section {coverage_input.section_index}/"
-                f"{coverage_input.total_sections} ({model})"
-            ),
-            settings=settings,
-            model=model,
-            thinking_level=thinking_level,
-            system_instruction=prompt_messages.system,
-            user_prompt=prompt_messages.user,
-            max_output_tokens=max_output_tokens,
-            response_mime_type="application/json",
-            response_json_schema=COVERAGE_CHECK_RESPONSE_JSON_SCHEMA,
-            parse_fn=lambda txt: parse_coverage_check_response(
-                txt,
-                total_segment_count=len(coverage_input.segments),
-            ),
-            client=client,
-            client_factory=client_factory,
-            progress_callback=progress_callback,
-            cancel_event=cancel_event,
-        )
-        return result.parsed, result
-
-    raise StageError(
-        stage="notes",
-        message=(
-            f"Transcript coverage check LLM mode '{settings.pipeline_llm_mode}' is not supported."
-        ),
-        hint=(
-            "Phase 6 wired Google Gemini into check_coverage_with_llm(). "
-            "Set PIPELINE_LLM_MODE=gemini (or PIPELINE_LLM_MODE=live) with GEMINI_API_KEY, "
-            "set PIPELINE_LLM_MODE=stub in .env to run deterministic local scaffolding, "
-            "or pass an explicit llm_callable."
-        ),
-    )
-
-
-def check_coverage_with_llm(
-    coverage_input: CoverageCheckInput,
-    settings: Settings,
-    *,
-    llm_callable: CoverageCheckLLMCallable | None = None,
-    client: Any | None = None,
-    client_factory: GenAIClientFactory | None = None,
-    progress_callback: ProgressCallback | None = None,
-) -> CoverageCheckResult:
-    """Audit transcript coverage against generated section notes via Gemini, callable, or stub."""
-    cov_result, _ = _check_coverage_with_usage(
-        coverage_input,
-        settings,
-        llm_callable=llm_callable,
-        client=client,
-        client_factory=client_factory,
-        progress_callback=progress_callback,
-    )
-    return cov_result
-
-
-def _merge_coverage_results(results: Sequence[CoverageCheckResult]) -> CoverageCheckResult:
-    if not results:
-        return CoverageCheckResult(
-            passed=True,
-            checked_sections=0,
-            covered_segment_count=0,
-            total_segment_count=0,
-            missing_items=(),
-            notes="No transcript sections to audit.",
-        )
-
-    all_gaps: list[CoverageGap] = []
-    covered = 0
-    total = 0
-    passed = True
-    for item in results:
-        all_gaps.extend(item.missing_items)
-        covered += item.covered_segment_count
-        total += item.total_segment_count
-        if not item.passed:
-            passed = False
-
-    if all_gaps:
-        passed = False
-
-    summary = (
-        f"Audited {len(results)} section(s): {covered}/{total} substantive segment(s) covered, "
-        f"{len(all_gaps)} gap(s) flagged."
-    )
-    return CoverageCheckResult(
-        passed=passed,
-        checked_sections=len(results),
-        covered_segment_count=covered,
-        total_segment_count=total,
-        missing_items=tuple(all_gaps),
-        notes=summary,
-    )
 
 
 def _render_uncovered_slides_section(
@@ -1647,12 +1274,12 @@ def generate_notes(
     lecture_title: str | None = None,
     chunk_config: SectionChunkConfig | None = None,
     section_llm_callable: SectionNotesLLMCallable | None = None,
-    coverage_llm_callable: CoverageCheckLLMCallable | None = None,
     client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
+    progress_fraction_callback: Callable[[float], None] | None = None,
     cancel_event: Event | None = None,
 ) -> NotesGenerationResult:
-    """Orchestrate section chunking, rolling context carry-over, LLM/stub generation, and coverage check."""
+    """Orchestrate section chunking, rolling context carry-over, and section generation."""
     mode = (settings.pipeline_llm_mode or "gemini").strip().lower()
     use_gemini = is_gemini_live_mode(mode)
 
@@ -1672,10 +1299,7 @@ def generate_notes(
 
     shared_client: Any | None = None
     owns_client = False
-    needs_gemini_client = use_gemini and (
-        section_llm_callable is None or coverage_llm_callable is None
-    )
-    if needs_gemini_client:
+    if use_gemini and section_llm_callable is None:
         validate_gemini_credentials(settings, stage="notes")
         factory = client_factory or create_gemini_client
         try:
@@ -1698,16 +1322,11 @@ def generate_notes(
     rolling_context = RollingContext()
     prompt_inputs: list[SectionPromptInput] = []
     section_markdowns: list[str] = []
-    coverage_results: list[CoverageCheckResult] = []
-    coverage_warnings: list[str] = []
     aligned_slide_numbers: set[int] = set()
 
     notes_input_tokens = 0
     notes_output_tokens = 0
     notes_thinking_tokens = 0
-    coverage_input_tokens = 0
-    coverage_output_tokens = 0
-    coverage_thinking_tokens = 0
 
     try:
         if progress_callback is not None:
@@ -1728,12 +1347,9 @@ def generate_notes(
 
         total_sections = len(sections)
         notes_workers = getattr(settings, "llm_notes_parallel_workers", DEFAULT_LLM_NOTES_PARALLEL_WORKERS)
-        coverage_workers = getattr(settings, "llm_coverage_parallel_workers", DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS)
-        min_audit_chars = getattr(settings, "notes_min_audit_transcript_chars", DEFAULT_NOTES_MIN_AUDIT_TRANSCRIPT_CHARS)
         parallel = (
             use_gemini
             and section_llm_callable is None
-            and coverage_llm_callable is None
             and notes_workers > 1
             and total_sections > 1
         )
@@ -1755,73 +1371,22 @@ def generate_notes(
                 with callback_lock:
                     progress_callback(message)
 
-        def should_skip_short_llm_audit(section: LectureSection) -> bool:
-            return use_gemini and coverage_llm_callable is None and section.transcript_chars < min_audit_chars
-
-        def audit(section: LectureSection, section_md: str):
-            coverage_input = CoverageCheckInput(
-                lecture_title=resolved_title,
-                section_index=section.section_index,
-                total_sections=section.total_sections,
-                section_kind=section.kind,
-                start_time=section.start_time,
-                end_time=section.end_time,
-                segments=section.segments,
-                generated_markdown=section_md,
-                slide_numbers=section.slide_numbers,
-            )
-            if use_gemini and coverage_llm_callable is None:
-                report(f"Auditing transcript coverage for section {section.section_index} of {total_sections}...")
-            try:
-                result, usage = _check_coverage_with_usage(
-                    coverage_input, settings, llm_callable=coverage_llm_callable, client=shared_client,
-                    client_factory=client_factory, progress_callback=report, cancel_event=effective_cancel,
-                )
-                return result, usage, ""
-            except StageError as exc:
-                if not use_gemini or coverage_llm_callable is not None:
-                    raise
-                warning = f"Coverage audit unavailable on section {section.section_index}: {exc.message}"
-                logger.warning("%s", warning)
-                result = CoverageCheckResult(
-                    passed=False,
-                    checked_sections=1,
-                    covered_segment_count=0,
-                    total_segment_count=len(section.segments),
-                    missing_items=(),
-                    notes=warning,
-                )
-                return result, None, warning
-
         notes = {}
-        audits = {}
-        skipped_short_audits = 0
         if parallel:
             prompt_inputs = _build_parallel_prompt_inputs(sections, resolved_title, slides_ocr)
-            with (
-                ThreadPoolExecutor(max_workers=min(notes_workers, total_sections)) as writers,
-                ThreadPoolExecutor(max_workers=min(coverage_workers, total_sections)) as reviewers,
-            ):
+            with ThreadPoolExecutor(max_workers=min(notes_workers, total_sections)) as writers:
                 drafts = {writers.submit(generate, p): section for p, section in zip(prompt_inputs, sections)}
-                reviews = {}
                 try:
                     for future in as_completed(drafts):
                         section = drafts[future]
                         idx = section.section_index
                         notes[idx] = future.result()
+                        if progress_fraction_callback is not None:
+                            progress_fraction_callback(len(notes) / total_sections)
                         report(f"Generated notes for {len(notes)}/{total_sections} sections...")
-                        if section.segments:
-                            if should_skip_short_llm_audit(section):
-                                skipped_short_audits += 1
-                            else:
-                                reviews[reviewers.submit(audit, section, notes[idx][0])] = idx
-                    audit_count = len(reviews)
-                    for future in as_completed(reviews):
-                        audits[reviews[future]] = future.result()
-                        report(f"Audited transcript coverage for {len(audits)}/{audit_count} sections...")
                 except BaseException:
                     local_cancel.set()
-                    for future in (*drafts, *reviews):
+                    for future in drafts:
                         future.cancel()
                     raise
         else:
@@ -1837,12 +1402,9 @@ def generate_notes(
                 prompt = _make_section_prompt(section, resolved_title, rolling_context)
                 prompt_inputs.append(prompt)
                 notes[idx] = generate(prompt)
+                if progress_fraction_callback is not None:
+                    progress_fraction_callback(len(notes) / total_sections)
                 markdown = notes[idx][0]
-                if section.segments:
-                    if should_skip_short_llm_audit(section):
-                        skipped_short_audits += 1
-                    else:
-                        audits[idx] = audit(section, markdown)
                 update_rolling_context(rolling_context, section, markdown)
 
         # Workers return usage with their results. Only the coordinator mutates totals.
@@ -1855,15 +1417,6 @@ def generate_notes(
                 notes_input_tokens += usage.input_tokens
                 notes_output_tokens += usage.output_tokens
                 notes_thinking_tokens += usage.thinking_tokens
-            if idx in audits:
-                result, usage, warning = audits[idx]
-                coverage_results.append(result)
-                if warning:
-                    coverage_warnings.append(warning)
-                if usage:
-                    coverage_input_tokens += usage.input_tokens
-                    coverage_output_tokens += usage.output_tokens
-                    coverage_thinking_tokens += usage.thinking_tokens
     finally:
         if owns_client:
             close_gemini_client(shared_client)
@@ -1871,24 +1424,6 @@ def generate_notes(
     if progress_callback is not None:
         progress_callback("Assembling final NotebookLM-ready Markdown document...")
 
-    merged_coverage = _merge_coverage_results(coverage_results)
-    if skipped_short_audits > 0:
-        skip_note = (
-            f"Skipped LLM coverage audit on {skipped_short_audits} short section(s) "
-            f"(< {min_audit_chars} chars; unaudited)."
-        )
-        merged_coverage = CoverageCheckResult(
-            passed=merged_coverage.passed,
-            checked_sections=merged_coverage.checked_sections,
-            covered_segment_count=merged_coverage.covered_segment_count,
-            total_segment_count=merged_coverage.total_segment_count,
-            missing_items=merged_coverage.missing_items,
-            notes=(
-                f"{merged_coverage.notes} {skip_note}".strip()
-                if coverage_results
-                else skip_note
-            ),
-        )
     uncovered_slides_md = _render_uncovered_slides_section(
         slides_ocr,
         alignment,
@@ -1910,27 +1445,16 @@ def generate_notes(
         warning_text = f"Alignment ({issue.code}): {issue.message}"
         if warning_text not in warnings:
             warnings.append(warning_text)
-    for cov_warning in merged_coverage.to_warnings():
-        if cov_warning not in warnings:
-            warnings.append(cov_warning)
-    for cov_warning in coverage_warnings:
-        if cov_warning not in warnings:
-            warnings.append(cov_warning)
-
     word_count = len(markdown.split())
     return NotesGenerationResult(
         markdown=markdown,
         sections=tuple(sections),
         prompt_inputs=tuple(prompt_inputs),
-        coverage_result=merged_coverage,
         warnings=tuple(warnings),
         word_count=word_count,
         notes_input_tokens=notes_input_tokens,
         notes_output_tokens=notes_output_tokens,
         notes_thinking_tokens=notes_thinking_tokens,
-        coverage_input_tokens=coverage_input_tokens,
-        coverage_output_tokens=coverage_output_tokens,
-        coverage_thinking_tokens=coverage_thinking_tokens,
     )
 
 
@@ -1955,6 +1479,7 @@ def run_notes_stage(
         ),
         client_factory=client_factory,
         progress_callback=context.report_progress,
+        progress_fraction_callback=context.progress_fraction_callback,
         cancel_event=context.cancel_event,
     )
 
@@ -1980,21 +1505,15 @@ def run_notes_stage(
             "aligned_sections": aligned_count,
             "off_slide_sections": off_slide_count,
             "uncertain_sections": uncertain_count,
-            "coverage_passed": result.coverage_result.passed,
-            "coverage_gaps": len(result.coverage_result.missing_items),
             "notes_input_tokens": result.notes_input_tokens,
             "notes_output_tokens": result.notes_output_tokens,
             "notes_thinking_tokens": result.notes_thinking_tokens,
-            "coverage_input_tokens": result.coverage_input_tokens,
-            "coverage_output_tokens": result.coverage_output_tokens,
-            "coverage_thinking_tokens": result.coverage_thinking_tokens,
         },
         warnings=list(result.warnings),
     )
 
 
 __all__ = [
-    "CoverageCheckLLMCallable",
     "DEFAULT_MAX_SECTION_DURATION_SECONDS",
     "DEFAULT_MAX_SECTION_TRANSCRIPT_CHARS",
     "DEFAULT_MAX_SLIDES_PER_SECTION",
@@ -2003,8 +1522,6 @@ __all__ = [
     "SectionChunkConfig",
     "SectionNotesLLMCallable",
     "build_lecture_sections",
-    "check_coverage_with_llm",
-    "check_section_coverage_stub",
     "derive_lecture_title",
     "generate_notes",
     "generate_section_notes_with_llm",

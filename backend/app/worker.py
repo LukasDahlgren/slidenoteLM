@@ -423,6 +423,9 @@ class JobWorker:
             progress_callback=lambda message: self.store.update_stage_message(
                 js.token, stage, message
             ),
+            progress_fraction_callback=lambda fraction: self.store.update_stage_fraction(
+                js.token, stage, fraction
+            ),
             cancel_event=js.cancel_event,
         )
 

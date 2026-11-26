@@ -504,8 +504,8 @@ def _auth_error_hint(settings: Settings, *, model: str) -> str:
         )
     return (
         f"Verify that GEMINI_API_KEY in .env is valid and has access/billing enabled for "
-        f"model '{model}'. To change models, update OCR_MODEL_GOOGLE, LLM_ALIGN_MODEL, "
-        "LLM_NOTES_MODEL, and LLM_COVERAGE_MODEL in .env, restart the backend, and retry."
+        f"model '{model}'. To change models, update OCR_MODEL_GOOGLE, LLM_ALIGN_MODEL, or "
+        "LLM_NOTES_MODEL in .env, restart the backend, and retry."
     )
 
 

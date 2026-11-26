@@ -44,7 +44,7 @@ slidenoteLM/
 │   │       ├── transcribe.py    # Groq Whisper chunked transcription
 │   │       ├── ocr.py           # Google Gemini structured slide OCR (no pdfplumber)
 │   │       ├── align.py         # Alignment contract, quality checks, stub hook (LLM in Phase 6)
-│   │       ├── notes.py         # Sectioning, context carry-over, lecture-source prompts, coverage-check contract, stub hook (LLM in Phase 6)
+│   │       ├── notes.py         # Sectioning, context carry-over, lecture-source prompts, stub hook (LLM in Phase 6)
 │   │       └── prompts.py       # English lecture-source Markdown prompt templates for NotebookLM
 │   └── tests/                   # unittest test suite
 └── frontend/
@@ -117,8 +117,8 @@ slidenoteLM/
   - Provide a clean hook (`align_with_llm(...)`) plus a deterministic stub mode (`PIPELINE_LLM_MODE=stub`) for end-to-end testing.
 - [x] Implement `backend/app/pipeline/prompts.py` and `backend/app/pipeline/notes.py`:
   - Implement section chunking (grouping contiguous aligned slides/transcript segments into manageable sections, plus explicit off-slide/demo/Q&A spans) and rolling context carry-over across section boundaries.
-  - Encode the full **Lecture Source Markdown Specification** (see below) in `prompts.py` (`AI_FIRST_MARKDOWN_RULES`), plus a **transcript coverage-check** prompt/contract to catch silently dropped explanations, lost meaning, or Q&A.
-  - Provide a clean single hook (`generate_section_notes_with_llm(...)` + `check_coverage_with_llm(...)`) and deterministic stub mode that emits valid, structured `notes.md` from `slides_ocr.json` + `transcript.json`.
+  - Encode the full **Lecture Source Markdown Specification** (see below) in `prompts.py` (`AI_FIRST_MARKDOWN_RULES`).
+  - Provide a clean single hook (`generate_section_notes_with_llm(...)`) and deterministic stub mode that emits valid, structured `notes.md` from `slides_ocr.json` + `transcript.json`.
 - [x] Add unit tests for sectioning, boundary context handoff, uncertainty fallback (timestamp-only), and Markdown assembly.
 
 ### Phase 5 — One-Screen Frontend UI & End-to-End Verification *(Completed)*
@@ -137,7 +137,7 @@ slidenoteLM/
 
 ### Phase 6 — Wire Chosen LLM Provider & Live Content Verification
 **Goal:** Plug Google Gemini 4 Neon (`gemini-4-neon`, varied `thinking_level` per stage) cleanly into the Phase 4 hooks via `google-genai` (keeping the app at 2 providers total: Groq Whisper + Google Gemini) and verify note fidelity on a real lecture.
-- [x] Bump `google-genai>=2.34.0` in `backend/requirements.txt` and add per-stage Gemini 4 Neon model & `thinking_level` env vars (`MEDIUM` for OCR, `HIGH` for Alignment & Notes, `MEDIUM` for Coverage Audit) to `.env.example` and `backend/app/config.py`.
+- [x] Bump `google-genai>=2.34.0` in `backend/requirements.txt` and add per-stage Gemini 4 Neon model & `thinking_level` env vars (`MEDIUM` for OCR, `HIGH` for Alignment & Notes) to `.env.example` and `backend/app/config.py`.
 - [x] Implement the single-provider Gemini 4 calls inside `backend/app/pipeline/gemini_client.py`, `backend/app/pipeline/ocr.py`, `backend/app/pipeline/align.py`, and `backend/app/pipeline/notes.py` (no multi-provider wrapper bloat), with unit tests in `backend/tests/test_phase6_gemini_llm.py`.
 - [ ] Run end-to-end on a real lecture (PDF + recording).
 - [ ] **Speech-only content check:**
@@ -164,10 +164,4 @@ The deliverable (`notes.md`) is one English Markdown source uploaded to **Notebo
    - Whenever slide alignment is uncertain (unresolved alignment warnings, out-of-order jumps, or unaligned spans), use the `[MM:SS–MM:SS]` timestamp alone instead of forcing a dubious slide number.
    - Do not repeat full heading hierarchies or fill out empty categories or fixed per-slide blocks.
    - Leave generated study aids (such as a formula glossary or exam checklist) to NotebookLM: keep formulas, source-supplied variable definitions, and assessment guidance where they were taught, and preserve a concluding recap only if the lecturer or deck actually provides one.
-9. **Long-lecture continuity and reliability:** Process in manageable sections through `notes.py`, carry rolling context and immediate prior boundary transcript overlap across section boundaries so explanations crossing slide or section boundaries remain coherent without repeating already-documented material, and run a transcript coverage check so substantive explanations, steps, qualifications, attribution, scope limits, corrections, or student Q&A are not silently lost.
-
-### Transcript Coverage Check (`COVERAGE_CHECK_SYSTEM_PROMPT` / `build_coverage_check_prompt`)
-
-- Audits each section's chronological transcript against the generated Markdown to catch silently dropped substantive content or loss of meaning.
-- Treats a missing step, a lost qualification, a change from tentative to definite, missing meaningful attribution (who asked, asserted, corrected, or speculated), omitted assessment cues/scope limits/certainty levels/timestamps, or omitted explanation-changing self-corrections or substantive slide/speech discrepancies as a loss of meaning.
-- Does **not** flag a clearly explained point that appears once in integrated form even when supported by both slide and speech, obvious ASR transcription typos normalized to the clear slide spelling, spoken filler/operational chatter/empty repetition, or omitted generated study aids and unknown metadata.
+9. **Long-lecture continuity and reliability:** Process in manageable sections through `notes.py`, carry rolling context and immediate prior boundary transcript overlap across section boundaries so explanations crossing slide or section boundaries remain coherent without repeating already-documented material. Preserve substantive explanations, steps, qualifications, attribution, scope limits, corrections, and student Q&A.

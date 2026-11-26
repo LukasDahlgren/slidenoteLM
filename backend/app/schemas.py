@@ -87,6 +87,7 @@ class JobContext:
     artifacts: dict[str, str] = field(default_factory=dict)
     progress_callback: ProgressCallback | None = field(default=None, repr=False, compare=False)
     cancel_event: threading.Event | None = field(default=None, repr=False, compare=False)
+    progress_fraction_callback: Callable[[float], None] | None = field(default=None, repr=False, compare=False)
 
     @property
     def audio_normalized_path(self) -> Path:

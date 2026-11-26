@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import unittest
@@ -43,13 +42,12 @@ def lecture(numbers, durations=None):
 class ParallelNotesTests(unittest.TestCase):
     def test_settings(self):
         defaults = {
-            "LLM_NOTES_PARALLEL_WORKERS": (9, 1), "LLM_COVERAGE_PARALLEL_WORKERS": (4, 1),
+            "LLM_NOTES_PARALLEL_WORKERS": (9, 1),
             "OCR_MAX_PAGES_PER_BATCH": (8, 1), "OCR_PARALLEL_WORKERS": (8, 1),
             "OCR_GLOBAL_MAX_CONCURRENT": (16, 1), "LLM_GLOBAL_MAX_CONCURRENT": (24, 1),
             "NOTES_MAX_SLIDES_PER_SECTION": (8, 1), "NOTES_MAX_SECTION_DURATION_SECONDS": (900, 30),
             "NOTES_MAX_SECTION_TRANSCRIPT_CHARS": (14000, 500),
             "NOTES_INLINE_OFF_SLIDE_MAX_SECONDS": (35, 0), "NOTES_INLINE_OFF_SLIDE_MAX_CHARS": (300, 0),
-            "NOTES_MIN_AUDIT_TRANSCRIPT_CHARS": (200, 0),
         }
         for override in (None, "1337", "-1"):
             with self.subTest(override=override), patch.dict(
@@ -89,30 +87,26 @@ class ParallelNotesTests(unittest.TestCase):
         self.assertEqual([s.kind for s in combined.sections], ["aligned"])
         self.assertEqual([s.slide for s in combined.sections[0].segments], [1, None, None, 2])
 
-    def test_concurrent_drafts_pipeline_audits_and_assemble_in_order(self):
+    def test_concurrent_drafts_assemble_in_order(self):
         rendezvous = Barrier(2)
-        second_audit_started = Event()
+        second_draft_finished = Event()
         lock = Lock()
         active = peak = 0
 
         def respond(*, model, contents, config):
             nonlocal active, peak
             idx = int(re.search(r"Section: (\d+) of", contents)[1])
-            if "### Source Transcript Segments" in contents:
-                if idx == 2:
-                    second_audit_started.set()
-                    raise RuntimeError("audit offline")
-                response = json.dumps({"passed": True, "covered_segment_count": 1})
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            rendezvous.wait(timeout=5)
+            if idx == 1:
+                self.assertTrue(second_draft_finished.wait(5))
             else:
-                with lock:
-                    active += 1
-                    peak = max(peak, active)
-                rendezvous.wait(timeout=5)
-                if idx == 1:
-                    self.assertTrue(second_audit_started.wait(5))
-                with lock:
-                    active -= 1
-                response = f"## Finished section {idx}"
+                second_draft_finished.set()
+            with lock:
+                active -= 1
+            response = f"## Finished section {idx}"
             return _FakeTextClient([response]).models.generate_content(
                 model=model, contents=contents, config=config,
             )
@@ -121,12 +115,12 @@ class ParallelNotesTests(unittest.TestCase):
         progress = []
         result = generate_notes(
             *lecture([1, 1, 1, 1, 1, 2]),
-            _make_settings(Path("."), notes_max_slides_per_section=1, notes_min_audit_transcript_chars=0,
+            _make_settings(Path("."), notes_max_slides_per_section=1,
                            llm_retry_attempts=1, llm_rate_limit_rpm=0),
             client_factory=lambda _: client,
             progress_fraction_callback=progress.append,
         )
-        self.assertEqual(progress, [0.25, 0.5, 0.75, 1.0])
+        self.assertEqual(progress, [0.5, 1.0])
         self.assertEqual(peak, 2)
         self.assertLess(result.markdown.index("## Finished section 1"), result.markdown.index("## Finished section 2"))
         first, second = result.prompt_inputs
@@ -137,11 +131,9 @@ class ParallelNotesTests(unittest.TestCase):
         self.assertEqual(second.rolling_context.prior_section_headings, ["Topic 1"])
         self.assertIn("Topic", second.rolling_context.key_terms)
         self.assertEqual((second.rolling_context.last_slide, second.rolling_context.last_timestamp), (1, 50))
-        self.assertFalse(result.coverage_result.passed)
-        self.assertTrue(any("Coverage audit unavailable on section 2" in w for w in result.warnings))
         self.assertEqual(result.notes_input_tokens, 2400)
 
-    def test_small_sections_skip_api_audit_without_false_certification(self):
+    def test_each_finished_draft_advances_progress(self):
         for workers in (1, 2):
             client = _FakeTextClient(["## Draft"] * 2)
             progress = []
@@ -153,10 +145,6 @@ class ParallelNotesTests(unittest.TestCase):
             )
             self.assertEqual(progress, [0.5, 1.0])
             self.assertEqual(len(client.calls), 2)
-            self.assertEqual(result.coverage_input_tokens, 0)
-            self.assertEqual(result.coverage_result.checked_sections, 0)
-            self.assertEqual(result.coverage_result.covered_segment_count, 0)
-            self.assertIn("unaudited", result.coverage_result.notes)
 
     def test_uncertain_and_off_slide_parallel_prompts_omit_numbered_outline(self):
         deck, transcript, alignment = lecture([1, 2, None], [10, 10, 60])
@@ -187,36 +175,6 @@ class ParallelNotesTests(unittest.TestCase):
         uncertain_user = build_section_notes_prompt(uncertain_prompt).user
         self.assertNotIn("Slide 2: Topic 2", uncertain_user)
         self.assertNotIn("[Slide 1]", uncertain_user)
-
-    def test_injected_coverage_callable_runs_sequentially_in_order(self):
-        seen: list[int] = []
-        active = peak = 0
-        lock = Lock()
-
-        def coverage_cb(_messages, payload, _settings):
-            nonlocal active, peak
-            with lock:
-                active += 1
-                peak = max(peak, active)
-                seen.append(payload.section_index)
-            with lock:
-                active -= 1
-            return {"passed": True, "covered_segment_count": len(payload.segments)}
-
-        client = _FakeTextClient(["## Section 1", "## Section 2", "## Section 3"])
-        generate_notes(
-            *lecture([1, 2, 3]),
-            _make_settings(
-                Path("."),
-                notes_max_slides_per_section=1,
-                llm_notes_parallel_workers=3,
-                llm_rate_limit_rpm=0,
-            ),
-            coverage_llm_callable=coverage_cb,
-            client_factory=lambda _: client,
-        )
-        self.assertEqual(peak, 1)
-        self.assertEqual(seen, [1, 2, 3])
 
     def test_draft_failure_interrupts_sibling_retry_backoff_immediately(self):
         from google.genai import errors as genai_errors
@@ -272,7 +230,7 @@ class ParallelNotesTests(unittest.TestCase):
         self.assertLess(elapsed, 5.0)
         self.assertEqual(call_counts[1], 1)
 
-    def test_draft_failure_cancels_queued_draft_and_audit(self):
+    def test_draft_failure_cancels_queued_draft(self):
         class ControlledPool:
             def __init__(self, *, max_workers):
                 self.tasks = []
@@ -289,7 +247,6 @@ class ParallelNotesTests(unittest.TestCase):
                 return future
 
         writers = ControlledPool(max_workers=2)
-        reviewers = ControlledPool(max_workers=1)
 
         def complete(futures):
             first, failed, pending = list(futures)
@@ -298,11 +255,10 @@ class ParallelNotesTests(unittest.TestCase):
             failed.set_exception(StageError(stage="notes", message="draft failure", hint="Retry"))
             yield failed
 
-        with patch("backend.app.pipeline.notes.ThreadPoolExecutor", side_effect=[writers, reviewers]), \
+        with patch("backend.app.pipeline.notes.ThreadPoolExecutor", return_value=writers), \
              patch("backend.app.pipeline.notes.as_completed", side_effect=complete), \
              self.assertRaisesRegex(StageError, "draft failure"):
             generate_notes(*lecture([1, 2, 3]), _make_settings(
-                Path("."), notes_max_slides_per_section=1, notes_min_audit_transcript_chars=0,
+                Path("."), notes_max_slides_per_section=1,
             ), client_factory=lambda _: object())
         self.assertTrue(writers.tasks[-1].cancelled())
-        self.assertTrue(reviewers.tasks[0].cancelled())

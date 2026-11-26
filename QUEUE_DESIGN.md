@@ -49,7 +49,7 @@ The 5 background stages map onto **4 distinct resource lanes**:
 | **Lane 1: `audio_prep`** | `audio_prep` | Local CPU + disk I/O (`ffmpeg` / `ffprobe`) — **0 external API calls** | Running 1 `ffmpeg` normalization at a time avoids disk/CPU thrashing and immediately deletes `input/recording.<ext>` on completion, freeing space before the next lecture starts. |
 | **Lane 2: `transcription`** | `transcription` | **Groq Whisper API** (`20 RPM`, up to 4 chunk workers) — **independent vendor** | 1 lecture's chunk workers already saturate Groq cleanly; zero overlap with Gemini or `ffmpeg`. |
 | **Lane 3: `ocr`** | `ocr` | **Google Gemini OCR** (`gemini-4-neon`, `LOW` thinking, `20 RPM` local bucket, up to 8 batch workers) | Independent of `ffmpeg` and Groq; **shares the Google Gemini API key** with Lane 4 (see Section 5.3 for pacing). |
-| **Lane 4: `llm`** | `alignment` → `notes` | **Google Gemini LLM** (`gemini-4-neon`, `HIGH`/`MEDIUM` thinking, `30 RPM` local bucket, 9 drafting + 4 audit workers) | Heavy Gemini consumer; keeping 1 lecture at a time in `alignment` → `notes` gets Lecture 1's `.md` finished as fast as possible. |
+| **Lane 4: `llm`** | `alignment` → `notes` | **Google Gemini LLM** (`gemini-4-neon`, `HIGH` thinking, `30 RPM` local bucket, 9 drafting workers) | Heavy Gemini consumer; keeping 1 lecture at a time in `alignment` → `notes` gets Lecture 1's `.md` finished as fast as possible. |
 
 ### 3.2 Assembly-Line Timeline (`J1`, `J2`, `J3`)
 
@@ -263,7 +263,7 @@ STAGE_DEPS: dict[PipelineStage, frozenset[PipelineStage]] = {
 Look closely at how providers overlap across the 4 lanes:
 - **`audio_prep` (local `ffmpeg`) + ANYTHING:** Zero API overlap — always runs at full speed.
 - **`transcription` (Groq Whisper, 20 RPM) + `ocr`/`alignment`/`notes` (Google Gemini):** Completely separate API vendors — always safe to overlap at full speed!
-- **`ocr` (Google Gemini `gemini-4-neon`, `LOW` thinking) + `alignment`/`notes` (Google Gemini `gemini-4-neon`, `HIGH`/`MEDIUM` thinking):**
+- **`ocr` (Google Gemini `gemini-4-neon`, `LOW` thinking) + `alignment`/`notes` (Google Gemini `gemini-4-neon`, `HIGH` thinking):**
   - Even though `slidenoteLM` uses separate local limiters (`OCR_RATE_LIMIT_RPM = 20`, `LLM_RATE_LIMIT_RPM = 30`), Google AI Studio / Vertex AI enforces **shared API-key / model-family RPM and TPM quotas**!
   - If `J1` has 9 concurrent `notes` calls AND `J2` fires 8 concurrent `ocr` batches at the exact same second (17 simultaneous `gemini-4-neon` calls), a standard API tier can burst into HTTP 429s and slow down `J1`.
 

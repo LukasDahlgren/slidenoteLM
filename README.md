@@ -13,7 +13,7 @@ See [PLAN.md](./PLAN.md) for the phased build plan and architectural guardrails.
   - macOS: `brew install ffmpeg`
 - API credentials (for live transcription, OCR, alignment, and note generation):
   - **Groq API key** (`GROQ_API_KEY`) for Whisper transcription
-  - **Google Gemini API key** (`GEMINI_API_KEY`) — or Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`) — for **Gemini 4 Neon** (`gemini-4-neon`) across structured slide OCR (`MEDIUM` thinking; no `pdfplumber` fallback), alignment (`HIGH` thinking), section Markdown notes (`HIGH` thinking), and transcript coverage audits (`MEDIUM` thinking). *(Note: ensure your Gemini API billing tier / Google AI Studio plan has access to your configured Gemini model.)*
+  - **Google Gemini API key** (`GEMINI_API_KEY`) — or Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`) — for **Gemini 4 Neon** (`gemini-4-neon`) across structured slide OCR (`MEDIUM` thinking; no `pdfplumber` fallback), alignment (`HIGH` thinking), and section Markdown notes (`HIGH` thinking). *(Note: ensure your Gemini API billing tier / Google AI Studio plan has access to your configured Gemini model.)*
 
 ## Setup
 
@@ -116,11 +116,11 @@ All `/api/*` endpoints use a built-in per-IP sliding-window rate limiter (emitti
 - `POST /api/jobs`: `10/min` (`RATE_LIMIT_JOBS_CREATE_PER_MINUTE`)
 - `GET /api/jobs/*` (status, preview, download): `120/min` (`RATE_LIMIT_JOBS_READ_PER_MINUTE`)
 - `GET /api/health` & other `/api/*`: `120/min` (`RATE_LIMIT_HEALTH_PER_MINUTE`, `RATE_LIMIT_DEFAULT_PER_MINUTE`)
-- Groq uses a 20 RPM limit. Gemini OCR uses 60 RPM and slide alignment, notes, and coverage share a 90 RPM limit (capped overall by `GEMINI_COMBINED_RATE_LIMIT_RPM=120`).
+- Groq uses a 20 RPM limit. Gemini OCR uses 60 RPM and slide alignment and notes share a 90 RPM limit (capped overall by `GEMINI_COMBINED_RATE_LIMIT_RPM=120`).
 
 Multiple queued lectures process concurrently across 4 multi-slot stage lanes (`audio_prep`: 2, `transcription`: 2, `ocr`: 3, `llm`: 3; up to 4 lectures in flight at once). Slide OCR runs alongside audio preparation and transcription, and alignment starts once both are ready.
 
-Gemini drafts up to nine lecture sections at once. Each worker receives a slide outline and the previous four transcript segments for continuity. Coverage checks start as drafts finish, and the final document follows lecture order. Short off-slide remarks between slides stay in the surrounding section with their own timestamp. Sections under 200 transcript characters use a local coverage check.
+Gemini drafts up to nine lecture sections at once. Each worker receives a slide outline and the previous four transcript segments for continuity. The final document follows lecture order. Short off-slide remarks between slides stay in the surrounding section with their own timestamp.
 
 | Setting | Default |
 | --- | ---: |
@@ -138,15 +138,13 @@ Gemini drafts up to nine lecture sections at once. Each worker receives a slide 
 | `LLM_RATE_LIMIT_RPM` | 90 |
 | `GEMINI_COMBINED_RATE_LIMIT_RPM` | 120 |
 | `LLM_NOTES_PARALLEL_WORKERS` | 9 |
-| `LLM_COVERAGE_PARALLEL_WORKERS` | 4 |
 | `NOTES_MAX_SLIDES_PER_SECTION` | 8 |
 | `NOTES_MAX_SECTION_DURATION_SECONDS` | 900.0 |
 | `NOTES_MAX_SECTION_TRANSCRIPT_CHARS` | 14000 |
 | `NOTES_INLINE_OFF_SLIDE_MAX_SECONDS` | 35.0 |
 | `NOTES_INLINE_OFF_SLIDE_MAX_CHARS` | 300 |
-| `NOTES_MIN_AUDIT_TRANSCRIPT_CHARS` | 200 |
 
 
 ## Status
 
-Phases 0–5 and Phase 6's Google Gemini 4 Neon wiring are completed (repo setup + `ffmpeg`/`ffprobe`, FastAPI + SQLite background job skeleton, FFmpeg audio normalization + chunked parallel Groq Whisper transcription, strict Google Gemini Slide OCR with PyMuPDF batching, live Gemini 4 Neon alignment + AI-first NotebookLM Markdown generation + coverage audit with varied `thinking_level`s and deterministic `stub` fallback, and the single-screen React + Vite UI with optional password gate, rate limiting, and Railway deployment support). Remaining in [PLAN.md](./PLAN.md): live end-to-end verification on a real lecture + 3-question speech-only content check.
+Phases 0–5 and Phase 6's Google Gemini 4 Neon wiring are completed (repo setup + `ffmpeg`/`ffprobe`, FastAPI + SQLite background job skeleton, FFmpeg audio normalization + chunked parallel Groq Whisper transcription, strict Google Gemini Slide OCR with PyMuPDF batching, live Gemini 4 Neon alignment + AI-first NotebookLM Markdown generation with varied `thinking_level`s and deterministic `stub` fallback, and the single-screen React + Vite UI with optional password gate, rate limiting, and Railway deployment support). Remaining in [PLAN.md](./PLAN.md): live end-to-end verification on a real lecture + 3-question speech-only content check.
