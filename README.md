@@ -29,19 +29,33 @@ cp .env.example .env
 
 `backend/app/config.py` loads `.env` with `override=False`, so secrets injected by `bws run` automatically take precedence over `.env`.
 
-1. Install the CLI (Windows):
-   ```powershell
-   winget install -e --id Bitwarden.BWS
-   ```
+1. Install the `bws` CLI:
+   - **Windows:**
+     ```powershell
+     winget install -e --id Bitwarden.BWS
+     ```
+   - **macOS (Apple Silicon):**
+     ```bash
+     curl -fsSL "https://github.com/bitwarden/sdk-sm/releases/download/bws-v2.1.0/bws-aarch64-apple-darwin-2.1.0.zip" -o /tmp/bws.zip
+     unzip -o /tmp/bws.zip -d /tmp/bws_extract
+     install -m 755 /tmp/bws_extract/bws ~/.local/bin/bws
+     rm -rf /tmp/bws.zip /tmp/bws_extract
+     ```
    *(If your Bitwarden account is hosted in the EU region, run `bws config server-base https://vault.bitwarden.eu` once.)*
 2. In Bitwarden Secrets Manager, create a project (e.g., `slidenoteLM`), add secrets named `GROQ_API_KEY` and `GEMINI_API_KEY`, and create a Machine Account with read access to that project.
-3. Add the non-secret project UUID to `.env` as `BWS_PROJECT_ID=<YOUR_PROJECT_UUID>` (leave `GROQ_API_KEY`, `GEMINI_API_KEY`, and `BWS_ACCESS_TOKEN` out of `.env` — and do **not** save `BWS_ACCESS_TOKEN` as a persistent OS environment variable).
+3. Add the non-secret project UUID to `.env` as `BWS_PROJECT_ID=<YOUR_PROJECT_UUID>` (leave `GROQ_API_KEY`, `GEMINI_API_KEY`, and `BWS_ACCESS_TOKEN` out of `.env` — and do **not** save `BWS_ACCESS_TOKEN` in persistent OS environment variables or `~/.zshrc`).
 4. Launch the backend:
-   ```powershell
-   .\scripts\run-backend.ps1
-   ```
-   The script prompts for `BWS_ACCESS_TOKEN` (masked input) once per terminal session and keeps it only in that terminal's memory until you close the window.
-   *(Use `.\scripts\run-backend.ps1 -SkipBws` to run directly from `.env` / stub mode without `bws`.)*
+   - **Windows (PowerShell):**
+     ```powershell
+     .\scripts\run-backend.ps1
+     ```
+     *(Use `.\scripts\run-backend.ps1 -SkipBws` to run directly from `.env` / stub mode without `bws`.)*
+   - **macOS / Linux:**
+     ```bash
+     ./scripts/run-backend.sh
+     ```
+     *(Use `./scripts/run-backend.sh --skip-bws` to run directly from `.env` / stub mode without `bws`.)*
+   Both scripts prompt for `BWS_ACCESS_TOKEN` with hidden input so the token is never written to disk or shell history.
 
 ### 2. Backend
 
