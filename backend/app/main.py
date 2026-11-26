@@ -205,7 +205,7 @@ def _concatenate_pdfs(part_paths: list[Path], destination: Path) -> None:
                 src.close()
 
         destination.parent.mkdir(parents=True, exist_ok=True)
-        merged.save(destination)
+        merged.save(destination, garbage=3, deflate=True)
     finally:
         merged.close()
 

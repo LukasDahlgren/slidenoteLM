@@ -679,6 +679,15 @@ def plan_pdf_batches(
     return batches
 
 
+_OVERSIZED_SLIDE_COMPRESSION_PROFILES: tuple[tuple[int, int, int], ...] = (
+    # (target_dpi, jpeg_quality, max_pixel_dim)
+    (200, 88, 3200),
+    (150, 82, 2400),
+    (120, 75, 1920),
+    (96, 68, 1440),
+)
+
+
 def _render_pdf_slice_bytes(source_doc: pymupdf.Document, page_start: int, page_end: int) -> bytes:
     """Slice 1-indexed inclusive pages from an open PyMuPDF document into PDF bytes."""
     batch_doc = pymupdf.open()
@@ -687,6 +696,42 @@ def _render_pdf_slice_bytes(source_doc: pymupdf.Document, page_start: int, page_
         return bytes(batch_doc.tobytes(garbage=3, deflate=True))
     finally:
         batch_doc.close()
+
+
+def _compress_oversized_single_slide_bytes(
+    source_doc: pymupdf.Document,
+    page_number: int,
+    max_bytes: int,
+) -> bytes | None:
+    """Rasterize an oversized single slide to JPEG-in-PDF so it fits under Gemini's inline limit."""
+    page = source_doc[page_number - 1]
+    rect = page.rect
+    max_pt = max(rect.width, rect.height)
+    if max_pt <= 0:
+        return None
+
+    for dpi, quality, max_dim in _OVERSIZED_SLIDE_COMPRESSION_PROFILES:
+        scale = min(dpi / 72.0, max_dim / max_pt)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+        img_bytes = pix.tobytes("jpeg", jpg_quality=quality)
+        out_doc = pymupdf.open()
+        try:
+            out_page = out_doc.new_page(width=rect.width, height=rect.height)
+            out_page.insert_image(out_page.rect, stream=img_bytes)
+            candidate = bytes(out_doc.tobytes(garbage=3, deflate=True))
+        finally:
+            out_doc.close()
+        if len(candidate) <= max_bytes:
+            logger.info(
+                "Compressed oversized slide %d via %d DPI JPEG (q=%d) to %d bytes (limit %d bytes).",
+                page_number,
+                dpi,
+                quality,
+                len(candidate),
+                max_bytes,
+            )
+            return candidate
+    return None
 
 
 def slice_pdf_batches(
@@ -736,17 +781,25 @@ def slice_pdf_batches(
                 pending_ranges.insert(0, (start, mid))
                 continue
             if len(slice_bytes) > safe_max_bytes:
-                raise StageError(
-                    stage="ocr",
-                    message=(
-                        f"Slide {start} alone is {len(slice_bytes):,} bytes, exceeding Gemini's "
-                        f"inline OCR batch limit ({safe_max_bytes:,} bytes)."
-                    ),
-                    hint=(
-                        "Compress high-resolution embedded images in the slide PDF "
-                        "(or re-export at 150-200 DPI) and retry."
-                    ),
+                compressed = _compress_oversized_single_slide_bytes(
+                    source_doc,
+                    start,
+                    safe_max_bytes,
                 )
+                if compressed is not None:
+                    slice_bytes = compressed
+                else:
+                    raise StageError(
+                        stage="ocr",
+                        message=(
+                            f"Slide {start} alone is {len(slice_bytes):,} bytes, exceeding Gemini's "
+                            f"inline OCR batch limit ({safe_max_bytes:,} bytes)."
+                        ),
+                        hint=(
+                            "Compress high-resolution embedded images in the slide PDF "
+                            "(or re-export at 150-200 DPI) and retry."
+                        ),
+                    )
             payloads.append(
                 PdfBatchPayload(
                     spec=PdfBatchSpec(index=len(payloads), page_start=start, page_end=end),

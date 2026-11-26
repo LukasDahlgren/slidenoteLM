@@ -477,6 +477,40 @@ class Phase3PdfSlicingAndBatchingTests(unittest.TestCase):
         self.assertEqual(oversize_ctx.exception.stage, "ocr")
         self.assertIn("exceeding Gemini's inline OCR batch limit", oversize_ctx.exception.message)
 
+    def test_slice_pdf_batches_compresses_oversized_single_slide_automatically(self) -> None:
+        pdf_path = _create_sample_pdf(
+            self.tmp_dir / "oversized_single.pdf",
+            ["Normal Slide 1", "Heavy Image Slide 2", "Normal Slide 3", "Normal Slide 4"],
+        )
+
+        # Simulate slide 2 raw PDF bytes being 35 MB while max_batch_bytes is 200 KB.
+        # Automatic JPEG-in-PDF rasterization should bring slide 2 well under 200 KB.
+        real_render = __import__(
+            "backend.app.pipeline.ocr", fromlist=["_render_pdf_slice_bytes"]
+        )._render_pdf_slice_bytes
+
+        def fake_render(doc, start: int, end: int) -> bytes:
+            if start <= 2 <= end:
+                return b"x" * (35 * 1024 * 1024)
+            return real_render(doc, start, end)
+
+        with mock.patch("backend.app.pipeline.ocr._render_pdf_slice_bytes", side_effect=fake_render):
+            payloads = slice_pdf_batches(
+                pdf_path,
+                page_count=4,
+                max_pages_per_batch=2,
+                max_batch_bytes=200 * 1024,
+                parallel_workers=1,
+            )
+
+        self.assertEqual(
+            [(p.spec.page_start, p.spec.page_end) for p in payloads],
+            [(1, 1), (2, 2), (3, 4)],
+        )
+        self.assertLessEqual(payloads[1].size_bytes, 200 * 1024)
+        with pymupdf.open(stream=payloads[1].pdf_bytes, filetype="pdf") as compressed_doc:
+            self.assertEqual(len(compressed_doc), 1)
+
 
 class Phase3GeminiOCRStageTests(unittest.TestCase):
     def setUp(self) -> None:
