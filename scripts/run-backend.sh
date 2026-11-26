@@ -16,7 +16,7 @@ Options:
   --host <HOST>        Bind address (defaults to BACKEND_HOST env/.env or 127.0.0.1)
   --port <PORT>        Bind port (defaults to BACKEND_PORT env/.env or 8000)
   --no-reload          Disable uvicorn --reload
-  --skip-bws           Run uvicorn directly without Bitwarden Secrets Manager (uses .env / stub mode)
+  --skip-bws           Run uvicorn directly from .env without Bitwarden Secrets Manager
   -h, --help           Show this help message
 EOF
 }
@@ -164,7 +164,7 @@ if [[ -z "${BWS_ACCESS_TOKEN:-}" ]]; then
     echo ""
     token="$(trim "${token:-}")"
     if [[ -z "$token" ]]; then
-        echo "Error: BWS_ACCESS_TOKEN is required (or run with --skip-bws to use .env / stub mode)." >&2
+        echo "Error: BWS_ACCESS_TOKEN is required (or run with --skip-bws to run directly from .env without bws)." >&2
         exit 1
     fi
     if [[ ! "$token" =~ $BWS_TOKEN_PATTERN ]]; then

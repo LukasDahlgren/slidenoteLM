@@ -121,24 +121,24 @@ slidenoteLM/
   - Provide a clean single hook (`generate_section_notes_with_llm(...)` + `check_coverage_with_llm(...)`) and deterministic stub mode that emits valid, structured `notes.md` from `slides_ocr.json` + `transcript.json`.
 - [x] Add unit tests for sectioning, boundary context handoff, uncertainty fallback (timestamp-only), and Markdown assembly.
 
-### Phase 5 — One-Screen Frontend UI & End-to-End Verification
+### Phase 5 — One-Screen Frontend UI & End-to-End Verification *(Completed)*
 **Goal:** Deliver a clean, single-screen browser UI for Windows and Mac and verify the complete upload → background run → reopen link → download `.md` flow.
-- [ ] Build the single-screen React + Vite UI (`frontend/src/`):
+- [x] Build the single-screen React + Vite UI (`frontend/src/`):
   - Drag-and-drop / file pickers for **one slide PDF** and **one audio or video recording**.
   - Start processing action; automatically navigate/update URL to `/jobs/<token>` once uploaded.
   - Copyable private result link banner so the user can close the tab and return anytime.
   - Clear stage-by-stage progress indicator (`Upload` → `Audio Prep` → `Transcription (Groq)` → `Slide OCR (Gemini)` → `Alignment` → `Markdown Notes` → `Ready`).
   - Actionable error panel naming the exact failed stage and what to do next (e.g., missing `ffmpeg`, invalid API key, Gemini OCR failure).
   - Download `.md` button (plus optional lightweight preview/stats: slide count, duration, word count).
-- [ ] Verify end-to-end flow locally:
+- [x] Verify end-to-end flow locally:
   - Upload fixture/real files → close tab → reopen `/jobs/<token>` → confirm background completion → download `.md`.
   - Verify stage-specific failure UI (including Gemini OCR failure with no `pdfplumber` fallback).
   - Run frontend `npm run lint` and `npm run build`, and backend `unittest` suite.
 
 ### Phase 6 — Wire Chosen LLM Provider & Live Content Verification
-**Goal:** Once you pick your exact LLM provider for alignment and note generation, plug that single SDK cleanly into the Phase 4 hooks and verify note fidelity on a real lecture.
-- [ ] Add the chosen provider SDK to `backend/requirements.txt` and its env var(s) to `.env.example`.
-- [ ] Implement the single-provider calls inside `backend/app/pipeline/align.py` and `backend/app/pipeline/notes.py` (no multi-provider wrapper bloat).
+**Goal:** Plug Google Gemini 4 Neon (`gemini-4-neon`, varied `thinking_level` per stage) cleanly into the Phase 4 hooks via `google-genai` (keeping the app at 2 providers total: Groq Whisper + Google Gemini) and verify note fidelity on a real lecture.
+- [x] Bump `google-genai>=2.34.0` in `backend/requirements.txt` and add per-stage Gemini 4 Neon model & `thinking_level` env vars (`LOW` for OCR, `HIGH` for Alignment & Notes, `MEDIUM` for Coverage Audit) to `.env.example` and `backend/app/config.py`.
+- [x] Implement the single-provider Gemini 4 calls inside `backend/app/pipeline/gemini_client.py`, `backend/app/pipeline/ocr.py`, `backend/app/pipeline/align.py`, and `backend/app/pipeline/notes.py` (no multi-provider wrapper bloat), with unit tests in `backend/tests/test_phase6_gemini_llm.py`.
 - [ ] Run end-to-end on a real lecture (PDF + recording).
 - [ ] **Speech-only content check:**
   - Pick **3 details found only in the speech** (not written on the slides), including **at least 1 requiring following the teacher's reasoning chain**.

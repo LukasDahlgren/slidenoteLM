@@ -11,9 +11,9 @@ See [PLAN.md](./PLAN.md) for the phased build plan and architectural guardrails.
 - **ffmpeg** (and `ffprobe`) available on your system `PATH`:
   - Windows: `winget install Gyan.FFmpeg` (then reopen your terminal)
   - macOS: `brew install ffmpeg`
-- API credentials (for live transcription & OCR):
+- API credentials (for live transcription, OCR, alignment, and note generation):
   - **Groq API key** (`GROQ_API_KEY`) for Whisper transcription
-  - **Google Gemini API key** (`GEMINI_API_KEY`) — or Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`) — for structured slide OCR (no `pdfplumber` fallback)
+  - **Google Gemini API key** (`GEMINI_API_KEY`) — or Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION`) — for **Gemini 4 Neon** (`gemini-4-neon`) across structured slide OCR (`LOW` thinking; no `pdfplumber` fallback), alignment (`HIGH` thinking), section Markdown notes (`HIGH` thinking), and transcript coverage audits (`MEDIUM` thinking). *(Note: ensure your Gemini API billing tier / Google AI Studio plan has access to your configured Gemini model.)*
 
 ## Setup
 
@@ -49,12 +49,12 @@ cp .env.example .env
      ```powershell
      .\scripts\run-backend.ps1
      ```
-     *(Use `.\scripts\run-backend.ps1 -SkipBws` to run directly from `.env` / stub mode without `bws`.)*
+     *(Use `.\scripts\run-backend.ps1 -SkipBws` to run directly from `.env` without `bws`.)*
    - **macOS / Linux:**
      ```bash
      ./scripts/run-backend.sh
      ```
-     *(Use `./scripts/run-backend.sh --skip-bws` to run directly from `.env` / stub mode without `bws`.)*
+     *(Use `./scripts/run-backend.sh --skip-bws` to run directly from `.env` without `bws`.)*
    Both scripts prompt for `BWS_ACCESS_TOKEN` with hidden input so the token is never written to disk or shell history.
 
 ### 2. Backend
@@ -103,7 +103,7 @@ The repository includes a multi-stage [`Dockerfile`](./Dockerfile) and [`railway
        - `APP_SESSION_SECRET=` *(optional; when empty, session cookie signing derives a stable key from `APP_PASSWORD` so restarts keep sessions valid)*
        - `GROQ_API_KEY=<your-groq-key>`
        - `GEMINI_API_KEY=<your-gemini-key>` *(or Vertex AI vars)*
-       - `PIPELINE_LLM_MODE=stub` *(or your configured LLM mode)*
+       - `PIPELINE_LLM_MODE=gemini` *(uses `gemini-4-neon` with varied thinking levels; set `stub` for deterministic offline testing)*
 4. **Custom domain with Cloudflare (important for large recordings):**
    - If you route a custom domain through Cloudflare, set the DNS record to **DNS only (grey cloud)** instead of Proxied (orange cloud). Cloudflare Free enforces a **100 MB** upload body limit that would reject larger lecture videos, whereas DNS-only lets uploads go straight to Railway.
 
@@ -116,8 +116,8 @@ All `/api/*` endpoints use a built-in per-IP sliding-window rate limiter (emitti
 - `POST /api/jobs`: `10/min` (`RATE_LIMIT_JOBS_CREATE_PER_MINUTE`)
 - `GET /api/jobs/*` (status, preview, download): `120/min` (`RATE_LIMIT_JOBS_READ_PER_MINUTE`)
 - `GET /api/health` & other `/api/*`: `120/min` (`RATE_LIMIT_HEALTH_PER_MINUTE`, `RATE_LIMIT_DEFAULT_PER_MINUTE`)
-- Outbound Groq / Gemini pacing: `20 RPM` each (`TRANSCRIBE_RATE_LIMIT_RPM`, `OCR_RATE_LIMIT_RPM`)
+- Outbound Groq / Gemini pacing: `20 RPM` each (`TRANSCRIBE_RATE_LIMIT_RPM`, `OCR_RATE_LIMIT_RPM`, and `LLM_RATE_LIMIT_RPM`, each paced independently)
 
 ## Status
 
-Phases 0–4 are implemented (repo setup + `ffmpeg`/`ffprobe`, FastAPI + SQLite background job skeleton, FFmpeg audio normalization + chunked parallel Groq Whisper transcription, strict Google Gemini Slide OCR with PyMuPDF batching, and alignment quality checks + AI-first NotebookLM Markdown scaffolding with deterministic stub mode). Follow [PLAN.md](./PLAN.md) for Phases 5–6.
+Phases 0–5 and Phase 6's Google Gemini 4 Neon wiring are completed (repo setup + `ffmpeg`/`ffprobe`, FastAPI + SQLite background job skeleton, FFmpeg audio normalization + chunked parallel Groq Whisper transcription, strict Google Gemini Slide OCR with PyMuPDF batching, live Gemini 4 Neon alignment + AI-first NotebookLM Markdown generation + coverage audit with varied `thinking_level`s and deterministic `stub` fallback, and the single-screen React + Vite UI with optional password gate, rate limiting, and Railway deployment support). Remaining in [PLAN.md](./PLAN.md): live end-to-end verification on a real lecture + 3-question speech-only content check.

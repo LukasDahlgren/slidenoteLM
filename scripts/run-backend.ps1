@@ -107,7 +107,7 @@ try {
             }
         }
         if (-not $token) {
-            Write-Error "BWS_ACCESS_TOKEN is required (or run with -SkipBws to use .env / stub mode)."
+            Write-Error "BWS_ACCESS_TOKEN is required (or run with -SkipBws to run directly from .env without bws)."
             exit 1
         }
         if ($token -notmatch $bwsTokenPattern) {
