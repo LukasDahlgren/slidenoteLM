@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -42,6 +45,9 @@ DEFAULT_TRANSCRIBE_RETRY_BASE_DELAY_SECONDS = 3.0
 DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS = 180.0
 
 # Google Gemini Slide OCR defaults
+DEFAULT_GEMINI_MODEL = "gemini-4-neon"
+DEFAULT_OCR_MODEL_GOOGLE = DEFAULT_GEMINI_MODEL
+DEFAULT_OCR_THINKING_LEVEL = "LOW"
 DEFAULT_OCR_MAX_PAGES_PER_BATCH = 20
 DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # 18 MiB (safely below Gemini's 20 MB inline limit)
 DEFAULT_OCR_PARALLEL_WORKERS = 2
@@ -52,6 +58,29 @@ DEFAULT_OCR_RETRY_ATTEMPTS = 3
 DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS = 2.0
 DEFAULT_OCR_TIMEOUT_SECONDS = 180.0
 DEFAULT_OCR_MAX_OUTPUT_TOKENS = 32768
+
+# Google Gemini LLM defaults (Phase 6: Alignment, Section Notes, Coverage Audit)
+DEFAULT_PIPELINE_LLM_MODE = "gemini"
+DEFAULT_LLM_ALIGN_MODEL = DEFAULT_GEMINI_MODEL
+DEFAULT_LLM_ALIGN_THINKING_LEVEL = "HIGH"
+DEFAULT_LLM_ALIGN_MAX_OUTPUT_TOKENS = 32768
+DEFAULT_LLM_NOTES_MODEL = DEFAULT_GEMINI_MODEL
+DEFAULT_LLM_NOTES_THINKING_LEVEL = "HIGH"
+DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS = 32768
+DEFAULT_LLM_COVERAGE_MODEL = DEFAULT_GEMINI_MODEL
+DEFAULT_LLM_COVERAGE_THINKING_LEVEL = "MEDIUM"
+DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS = 16384
+DEFAULT_LLM_GLOBAL_MAX_CONCURRENT = 4
+DEFAULT_LLM_RATE_LIMIT_RPM = 20
+DEFAULT_LLM_RETRY_ATTEMPTS = 4
+DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS = 2.0
+DEFAULT_LLM_TIMEOUT_SECONDS = 300.0
+
+VALID_THINKING_LEVELS: frozenset[str] = frozenset(
+    {"MINIMAL", "LOW", "MEDIUM", "HIGH", "XHIGH"}
+)
+THINKING_LEVEL_OFF_ALIASES: frozenset[str] = frozenset({"OFF", "NONE"})
+THINKING_LEVEL_DEFAULT_ALIASES: frozenset[str] = frozenset({"DEFAULT", "UNSPECIFIED"})
 
 # HTTP API rate-limiting defaults (sliding window per client IP; 0 disables a bucket)
 DEFAULT_RATE_LIMIT_ENABLED = True
@@ -92,6 +121,28 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_thinking_level_env(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().upper()
+    if normalized in THINKING_LEVEL_OFF_ALIASES:
+        # Gemini 4 cannot disable thinking completely; map OFF/NONE to the lowest tier (MINIMAL).
+        return "MINIMAL"
+    if normalized in THINKING_LEVEL_DEFAULT_ALIASES:
+        return ""
+    if normalized in VALID_THINKING_LEVELS:
+        return normalized
+    logger.warning(
+        "Ignoring invalid %s=%r (expected one of %s, OFF/NONE, or DEFAULT); using %r.",
+        name,
+        raw,
+        ", ".join(sorted(VALID_THINKING_LEVELS)),
+        default,
+    )
+    return default
 
 
 def _parse_frontend_origins(raw_value: str | None) -> tuple[str, ...]:
@@ -139,11 +190,26 @@ class Settings:
         "http://localhost:5173",
         "http://127.0.0.1:5173",
     )
-    pipeline_llm_mode: str = "stub"
+    pipeline_llm_mode: str = DEFAULT_PIPELINE_LLM_MODE
     groq_api_key: str = ""
     transcription_model: str = "whisper-large-v3-turbo"
     gemini_api_key: str = ""
-    ocr_model_google: str = "gemini-2.5-flash"
+    ocr_model_google: str = DEFAULT_OCR_MODEL_GOOGLE
+    ocr_thinking_level: str = DEFAULT_OCR_THINKING_LEVEL
+    llm_align_model: str = DEFAULT_LLM_ALIGN_MODEL
+    llm_align_thinking_level: str = DEFAULT_LLM_ALIGN_THINKING_LEVEL
+    llm_align_max_output_tokens: int = DEFAULT_LLM_ALIGN_MAX_OUTPUT_TOKENS
+    llm_notes_model: str = DEFAULT_LLM_NOTES_MODEL
+    llm_notes_thinking_level: str = DEFAULT_LLM_NOTES_THINKING_LEVEL
+    llm_notes_max_output_tokens: int = DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS
+    llm_coverage_model: str = DEFAULT_LLM_COVERAGE_MODEL
+    llm_coverage_thinking_level: str = DEFAULT_LLM_COVERAGE_THINKING_LEVEL
+    llm_coverage_max_output_tokens: int = DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS
+    llm_global_max_concurrent: int = DEFAULT_LLM_GLOBAL_MAX_CONCURRENT
+    llm_rate_limit_rpm: int = DEFAULT_LLM_RATE_LIMIT_RPM
+    llm_retry_attempts: int = DEFAULT_LLM_RETRY_ATTEMPTS
+    llm_retry_base_delay_seconds: float = DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS
+    llm_timeout_seconds: float = DEFAULT_LLM_TIMEOUT_SECONDS
     google_genai_use_vertexai: bool = False
     google_cloud_project: str = ""
     google_cloud_location: str = "us-central1"
@@ -219,13 +285,74 @@ def load_settings(
         backend_port=_parse_int_env("BACKEND_PORT", 8000, minimum=1),
         frontend_origin=frontend_origins[0],
         frontend_origins=frontend_origins,
-        pipeline_llm_mode=(os.getenv("PIPELINE_LLM_MODE", "stub").strip().lower() or "stub"),
+        pipeline_llm_mode=(
+            os.getenv("PIPELINE_LLM_MODE", DEFAULT_PIPELINE_LLM_MODE).strip().lower()
+            or DEFAULT_PIPELINE_LLM_MODE
+        ),
         groq_api_key=os.getenv("GROQ_API_KEY", "").strip(),
         transcription_model=os.getenv("TRANSCRIPTION_MODEL", "whisper-large-v3-turbo").strip()
         or "whisper-large-v3-turbo",
         gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip(),
-        ocr_model_google=os.getenv("OCR_MODEL_GOOGLE", "gemini-2.5-flash").strip()
-        or "gemini-2.5-flash",
+        ocr_model_google=os.getenv("OCR_MODEL_GOOGLE", DEFAULT_OCR_MODEL_GOOGLE).strip()
+        or DEFAULT_OCR_MODEL_GOOGLE,
+        ocr_thinking_level=_parse_thinking_level_env(
+            "OCR_THINKING_LEVEL", DEFAULT_OCR_THINKING_LEVEL
+        ),
+        llm_align_model=os.getenv("LLM_ALIGN_MODEL", DEFAULT_LLM_ALIGN_MODEL).strip()
+        or DEFAULT_LLM_ALIGN_MODEL,
+        llm_align_thinking_level=_parse_thinking_level_env(
+            "LLM_ALIGN_THINKING_LEVEL", DEFAULT_LLM_ALIGN_THINKING_LEVEL
+        ),
+        llm_align_max_output_tokens=_parse_int_env(
+            "LLM_ALIGN_MAX_OUTPUT_TOKENS",
+            DEFAULT_LLM_ALIGN_MAX_OUTPUT_TOKENS,
+            minimum=1024,
+        ),
+        llm_notes_model=os.getenv("LLM_NOTES_MODEL", DEFAULT_LLM_NOTES_MODEL).strip()
+        or DEFAULT_LLM_NOTES_MODEL,
+        llm_notes_thinking_level=_parse_thinking_level_env(
+            "LLM_NOTES_THINKING_LEVEL", DEFAULT_LLM_NOTES_THINKING_LEVEL
+        ),
+        llm_notes_max_output_tokens=_parse_int_env(
+            "LLM_NOTES_MAX_OUTPUT_TOKENS",
+            DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS,
+            minimum=1024,
+        ),
+        llm_coverage_model=os.getenv("LLM_COVERAGE_MODEL", DEFAULT_LLM_COVERAGE_MODEL).strip()
+        or DEFAULT_LLM_COVERAGE_MODEL,
+        llm_coverage_thinking_level=_parse_thinking_level_env(
+            "LLM_COVERAGE_THINKING_LEVEL", DEFAULT_LLM_COVERAGE_THINKING_LEVEL
+        ),
+        llm_coverage_max_output_tokens=_parse_int_env(
+            "LLM_COVERAGE_MAX_OUTPUT_TOKENS",
+            DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS,
+            minimum=1024,
+        ),
+        llm_global_max_concurrent=_parse_int_env(
+            "LLM_GLOBAL_MAX_CONCURRENT",
+            DEFAULT_LLM_GLOBAL_MAX_CONCURRENT,
+            minimum=1,
+        ),
+        llm_rate_limit_rpm=_parse_int_env(
+            "LLM_RATE_LIMIT_RPM",
+            DEFAULT_LLM_RATE_LIMIT_RPM,
+            minimum=0,
+        ),
+        llm_retry_attempts=_parse_int_env(
+            "LLM_RETRY_ATTEMPTS",
+            DEFAULT_LLM_RETRY_ATTEMPTS,
+            minimum=1,
+        ),
+        llm_retry_base_delay_seconds=_parse_float_env(
+            "LLM_RETRY_BASE_DELAY_SECONDS",
+            DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS,
+            minimum=0.0,
+        ),
+        llm_timeout_seconds=_parse_float_env(
+            "LLM_TIMEOUT_SECONDS",
+            DEFAULT_LLM_TIMEOUT_SECONDS,
+            minimum=5.0,
+        ),
         google_genai_use_vertexai=_parse_bool_env("GOOGLE_GENAI_USE_VERTEXAI", False),
         google_cloud_project=os.getenv("GOOGLE_CLOUD_PROJECT", "").strip(),
         google_cloud_location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1").strip()

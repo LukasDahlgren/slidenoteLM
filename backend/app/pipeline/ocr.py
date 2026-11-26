@@ -19,7 +19,7 @@ import pymupdf
 from google import genai
 from google.genai import types
 
-from ..config import Settings
+from ..config import DEFAULT_OCR_MODEL_GOOGLE, DEFAULT_OCR_THINKING_LEVEL, Settings
 from ..ratelimit import OutboundRateLimiter
 from ..schemas import (
     ARTIFACT_SLIDES_OCR,
@@ -30,6 +30,11 @@ from ..schemas import (
     StageError,
     StageResult,
 )
+from .gemini_client import (
+    build_thinking_config,
+    extract_retry_after_seconds as _shared_extract_retry_after_seconds,
+    supports_thinking_level,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +42,7 @@ GenAIClientFactory = Callable[[Settings], Any]
 SleepFn = Callable[[float], None]
 JitterFn = Callable[[float, float], float]
 
-DEFAULT_OCR_MODEL = "gemini-2.5-flash"
+DEFAULT_OCR_MODEL = DEFAULT_OCR_MODEL_GOOGLE
 DEFAULT_OCR_MAX_PAGES_PER_BATCH = 20
 DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # Safely below Gemini's 20 MB inline payload limit
 DEFAULT_OCR_PARALLEL_WORKERS = 2
@@ -235,18 +240,8 @@ def _extract_status_code(exc: Exception) -> int | None:
 
 
 def _extract_retry_after_seconds(exc: Exception) -> float | None:
-    response = getattr(exc, "response", None)
-    headers = getattr(response, "headers", None) if response is not None else None
-    if headers is None:
-        return None
-    raw = headers.get("retry-after") or headers.get("Retry-After")
-    if raw is None:
-        return None
-    try:
-        parsed = float(str(raw).strip())
-    except ValueError:
-        return None
-    if parsed <= 0:
+    parsed = _shared_extract_retry_after_seconds(exc)
+    if parsed is None:
         return None
     return min(parsed, _MAX_RETRY_AFTER_SECONDS)
 
@@ -1018,6 +1013,7 @@ def _ocr_single_batch_once(
     *,
     model: str,
     max_output_tokens: int,
+    thinking_level: str = DEFAULT_OCR_THINKING_LEVEL,
     semaphore: threading.BoundedSemaphore,
     rate_limiter: OutboundRateLimiter | None = None,
     batch_label: str = "",
@@ -1029,11 +1025,17 @@ def _ocr_single_batch_once(
         data=batch_payload.pdf_bytes,
         mime_type="application/pdf",
     )
-    config = types.GenerateContentConfig(
-        temperature=0.0,
-        max_output_tokens=max_output_tokens,
-        response_mime_type="application/json",
-    )
+    thinking_config = build_thinking_config(thinking_level, model=model)
+    config_kwargs: dict[str, Any] = {
+        "max_output_tokens": max_output_tokens,
+        "response_mime_type": "application/json",
+    }
+    if thinking_config is not None:
+        config_kwargs["thinking_config"] = thinking_config
+    # Gemini 3+/4 reasoning models recommend keeping the default temperature (1.0).
+    if not supports_thinking_level(model):
+        config_kwargs["temperature"] = 0.0
+    config = types.GenerateContentConfig(**config_kwargs)
 
     if rate_limiter is not None:
         def _notify_wait(wait_seconds: float) -> None:
@@ -1099,6 +1101,7 @@ def _ocr_single_batch_with_retries(
         DEFAULT_OCR_MAX_OUTPUT_TOKENS,
         minimum=1024,
     )
+    thinking_level = str(getattr(settings, "ocr_thinking_level", DEFAULT_OCR_THINKING_LEVEL) or "")
 
     batch_label = (
         f"Batch {batch_payload.spec.index + 1}/{total_batches} "
@@ -1123,6 +1126,7 @@ def _ocr_single_batch_with_retries(
                 batch_payload,
                 model=model,
                 max_output_tokens=max_output_tokens,
+                thinking_level=thinking_level,
                 semaphore=semaphore,
                 rate_limiter=rate_limiter,
                 batch_label=batch_label,
