@@ -19,6 +19,7 @@ from ..schemas import (
 TARGET_SAMPLE_RATE = 16000
 TARGET_CHANNELS = 1
 DEFAULT_TARGET_BITRATE = DEFAULT_TRANSCRIBE_TARGET_BITRATE
+FFMPEG_STALL_SECONDS = 180
 
 FFMPEG_INSTALL_HINT = (
     "Install FFmpeg so both 'ffmpeg' and 'ffprobe' are available on PATH "
@@ -86,6 +87,7 @@ def resolve_ffmpeg_binaries(
             stage=stage,
             message=f"Required media tool(s) not found on PATH: {missing_str}.",
             hint=FFMPEG_INSTALL_HINT,
+            fatal_for_queue=True,
         )
 
     assert ffmpeg_bin is not None
@@ -219,6 +221,36 @@ def probe_audio_duration(
     )
 
 
+def _run_ffmpeg(command: list[str], output: Path, stage: PipelineStage) -> None:
+    # Jobs run unattended. In particular, FFmpeg must never poll the server's console.
+    with subprocess.Popen(
+        [command[0], "-nostdin", *command[1:]],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    ) as proc:
+        size = 0
+        while True:
+            try:
+                _, stderr = proc.communicate(timeout=FFMPEG_STALL_SECONDS)
+                break
+            except subprocess.TimeoutExpired:
+                current_size = output.stat().st_size if output.exists() else 0
+                if current_size > size:
+                    size = current_size
+                    continue
+                proc.kill()
+                proc.communicate()
+                output.unlink(missing_ok=True)
+                raise StageError(
+                    stage=stage,
+                    message=f"FFmpeg wrote no audio for {FFMPEG_STALL_SECONDS} seconds.",
+                    hint="Check that the recording plays through and that the job disk has free space.",
+                )
+        if proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, command, stderr=stderr)
+
+
 def normalize_audio_to_mp3(
     source_path: Path,
     target_mp3_path: Path,
@@ -263,12 +295,7 @@ def normalize_audio_to_mp3(
     ]
 
     try:
-        subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        _run_ffmpeg(command, temp_target, stage)
     except FileNotFoundError as exc:
         temp_target.unlink(missing_ok=True)
         raise StageError(
@@ -408,12 +435,7 @@ def extract_audio_chunk(
     ]
 
     try:
-        subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
+        _run_ffmpeg(command, output, stage)
     except FileNotFoundError as exc:
         output.unlink(missing_ok=True)
         raise StageError(

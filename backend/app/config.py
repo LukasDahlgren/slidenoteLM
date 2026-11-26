@@ -32,6 +32,17 @@ DEFAULT_MAX_PDF_BYTES = 100 * 1024 * 1024  # 100 MB
 DEFAULT_MAX_RECORDING_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
 DEFAULT_WORKER_CONCURRENCY = 2
 
+# Multi-lecture pipelined queue defaults
+DEFAULT_QUEUE_MAX_IN_FLIGHT_JOBS = 2
+DEFAULT_QUEUE_OCR_OVERLAP_WITH_LLM = "paced"
+VALID_QUEUE_OCR_OVERLAP_MODES: frozenset[str] = frozenset({"paced", "strict", "full"})
+DEFAULT_QUEUE_LOOKAHEAD_OCR_WORKERS = 2
+DEFAULT_GEMINI_COMBINED_RATE_LIMIT_RPM = 40
+DEFAULT_QUEUE_AUTO_PAUSE_ON_AUTH_ERROR = True
+DEFAULT_CLEANUP_RAW_RECORDING_AFTER_AUDIO_PREP = True
+DEFAULT_MAX_QUEUE_DEPTH = 50
+DEFAULT_MIN_FREE_DISK_BYTES = 512 * 1024 * 1024  # 512 MiB
+
 # Audio normalization & Groq Whisper transcription defaults
 DEFAULT_TRANSCRIBE_TARGET_BITRATE = "32k"
 DEFAULT_TRANSCRIBE_MAX_UPLOAD_BYTES = 24_000_000  # Safely below Groq's 25 MB limit
@@ -47,12 +58,12 @@ DEFAULT_TRANSCRIBE_TIMEOUT_SECONDS = 180.0
 # Google Gemini Slide OCR defaults
 DEFAULT_GEMINI_MODEL = "gemini-4-neon"
 DEFAULT_OCR_MODEL_GOOGLE = DEFAULT_GEMINI_MODEL
-DEFAULT_OCR_THINKING_LEVEL = "LOW"
-DEFAULT_OCR_MAX_PAGES_PER_BATCH = 20
+DEFAULT_OCR_THINKING_LEVEL = "MEDIUM"
+DEFAULT_OCR_MAX_PAGES_PER_BATCH = 8
 DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # 18 MiB (safely below Gemini's 20 MB inline limit)
-DEFAULT_OCR_PARALLEL_WORKERS = 4
+DEFAULT_OCR_PARALLEL_WORKERS = 8
 DEFAULT_OCR_PARALLEL_MIN_PAGES = 4
-DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 6
+DEFAULT_OCR_GLOBAL_MAX_CONCURRENT = 8
 DEFAULT_OCR_RATE_LIMIT_RPM = 20
 DEFAULT_OCR_RETRY_ATTEMPTS = 3
 DEFAULT_OCR_RETRY_BASE_DELAY_SECONDS = 2.0
@@ -70,11 +81,11 @@ DEFAULT_LLM_NOTES_MAX_OUTPUT_TOKENS = 49152
 DEFAULT_LLM_COVERAGE_MODEL = DEFAULT_GEMINI_MODEL
 DEFAULT_LLM_COVERAGE_THINKING_LEVEL = "MEDIUM"
 DEFAULT_LLM_COVERAGE_MAX_OUTPUT_TOKENS = 16384
-DEFAULT_LLM_GLOBAL_MAX_CONCURRENT = 8
+DEFAULT_LLM_GLOBAL_MAX_CONCURRENT = 12
 DEFAULT_LLM_RATE_LIMIT_RPM = 30
 DEFAULT_LLM_RETRY_ATTEMPTS = 4
 DEFAULT_LLM_RETRY_BASE_DELAY_SECONDS = 2.0
-DEFAULT_LLM_NOTES_PARALLEL_WORKERS = 4
+DEFAULT_LLM_NOTES_PARALLEL_WORKERS = 9
 DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS = 4
 DEFAULT_NOTES_MAX_SLIDES_PER_SECTION = 8
 DEFAULT_NOTES_MAX_SECTION_DURATION_SECONDS = 900.0
@@ -96,8 +107,9 @@ DEFAULT_RATE_LIMIT_WINDOW_SECONDS = 60
 DEFAULT_RATE_LIMIT_TRUST_PROXY_HEADERS = True
 DEFAULT_RATE_LIMIT_AUTH_LOGIN_PER_WINDOW = 10
 DEFAULT_RATE_LIMIT_AUTH_PER_WINDOW = 60
-DEFAULT_RATE_LIMIT_JOBS_CREATE_PER_WINDOW = 10
+DEFAULT_RATE_LIMIT_JOBS_CREATE_PER_WINDOW = 30
 DEFAULT_RATE_LIMIT_JOBS_READ_PER_WINDOW = 120
+DEFAULT_RATE_LIMIT_QUEUE_CONTROL_PER_WINDOW = 60
 DEFAULT_RATE_LIMIT_HEALTH_PER_WINDOW = 120
 DEFAULT_RATE_LIMIT_DEFAULT_PER_WINDOW = 120
 
@@ -129,6 +141,23 @@ def _parse_bool_env(name: str, default: bool = False) -> bool:
     if raw is None or not raw.strip():
         return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_ocr_overlap_mode_env(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    normalized = raw.strip().lower()
+    if normalized in VALID_QUEUE_OCR_OVERLAP_MODES:
+        return normalized
+    logger.warning(
+        "Ignoring invalid %s=%r (expected one of %s); using %r.",
+        name,
+        raw,
+        ", ".join(sorted(VALID_QUEUE_OCR_OVERLAP_MODES)),
+        default,
+    )
+    return default
 
 
 def _parse_thinking_level_env(name: str, default: str) -> str:
@@ -256,8 +285,18 @@ class Settings:
     rate_limit_auth_per_window: int = DEFAULT_RATE_LIMIT_AUTH_PER_WINDOW
     rate_limit_jobs_create_per_window: int = DEFAULT_RATE_LIMIT_JOBS_CREATE_PER_WINDOW
     rate_limit_jobs_read_per_window: int = DEFAULT_RATE_LIMIT_JOBS_READ_PER_WINDOW
+    rate_limit_queue_control_per_window: int = DEFAULT_RATE_LIMIT_QUEUE_CONTROL_PER_WINDOW
     rate_limit_health_per_window: int = DEFAULT_RATE_LIMIT_HEALTH_PER_WINDOW
     rate_limit_default_per_window: int = DEFAULT_RATE_LIMIT_DEFAULT_PER_WINDOW
+
+    queue_max_in_flight_jobs: int = DEFAULT_QUEUE_MAX_IN_FLIGHT_JOBS
+    queue_ocr_overlap_with_llm: str = DEFAULT_QUEUE_OCR_OVERLAP_WITH_LLM
+    queue_lookahead_ocr_workers: int = DEFAULT_QUEUE_LOOKAHEAD_OCR_WORKERS
+    gemini_combined_rate_limit_rpm: int = DEFAULT_GEMINI_COMBINED_RATE_LIMIT_RPM
+    queue_auto_pause_on_auth_error: bool = DEFAULT_QUEUE_AUTO_PAUSE_ON_AUTH_ERROR
+    cleanup_raw_recording_after_audio_prep: bool = DEFAULT_CLEANUP_RAW_RECORDING_AFTER_AUDIO_PREP
+    max_queue_depth: int = DEFAULT_MAX_QUEUE_DEPTH
+    min_free_disk_bytes: int = DEFAULT_MIN_FREE_DISK_BYTES
 
     llm_notes_parallel_workers: int = DEFAULT_LLM_NOTES_PARALLEL_WORKERS
     llm_coverage_parallel_workers: int = DEFAULT_LLM_COVERAGE_PARALLEL_WORKERS
@@ -544,6 +583,11 @@ def load_settings(
             DEFAULT_RATE_LIMIT_JOBS_READ_PER_WINDOW,
             minimum=0,
         ),
+        rate_limit_queue_control_per_window=_parse_int_env(
+            "RATE_LIMIT_QUEUE_CONTROL_PER_MINUTE",
+            DEFAULT_RATE_LIMIT_QUEUE_CONTROL_PER_WINDOW,
+            minimum=0,
+        ),
         rate_limit_health_per_window=_parse_int_env(
             "RATE_LIMIT_HEALTH_PER_MINUTE",
             DEFAULT_RATE_LIMIT_HEALTH_PER_WINDOW,
@@ -552,6 +596,43 @@ def load_settings(
         rate_limit_default_per_window=_parse_int_env(
             "RATE_LIMIT_DEFAULT_PER_MINUTE",
             DEFAULT_RATE_LIMIT_DEFAULT_PER_WINDOW,
+            minimum=0,
+        ),
+        queue_max_in_flight_jobs=_parse_int_env(
+            "QUEUE_MAX_IN_FLIGHT_JOBS",
+            DEFAULT_QUEUE_MAX_IN_FLIGHT_JOBS,
+            minimum=1,
+        ),
+        queue_ocr_overlap_with_llm=_parse_ocr_overlap_mode_env(
+            "QUEUE_OCR_OVERLAP_WITH_LLM",
+            DEFAULT_QUEUE_OCR_OVERLAP_WITH_LLM,
+        ),
+        queue_lookahead_ocr_workers=_parse_int_env(
+            "QUEUE_LOOKAHEAD_OCR_WORKERS",
+            DEFAULT_QUEUE_LOOKAHEAD_OCR_WORKERS,
+            minimum=1,
+        ),
+        gemini_combined_rate_limit_rpm=_parse_int_env(
+            "GEMINI_COMBINED_RATE_LIMIT_RPM",
+            DEFAULT_GEMINI_COMBINED_RATE_LIMIT_RPM,
+            minimum=0,
+        ),
+        queue_auto_pause_on_auth_error=_parse_bool_env(
+            "QUEUE_AUTO_PAUSE_ON_AUTH_ERROR",
+            DEFAULT_QUEUE_AUTO_PAUSE_ON_AUTH_ERROR,
+        ),
+        cleanup_raw_recording_after_audio_prep=_parse_bool_env(
+            "CLEANUP_RAW_RECORDING_AFTER_AUDIO_PREP",
+            DEFAULT_CLEANUP_RAW_RECORDING_AFTER_AUDIO_PREP,
+        ),
+        max_queue_depth=_parse_int_env(
+            "MAX_QUEUE_DEPTH",
+            DEFAULT_MAX_QUEUE_DEPTH,
+            minimum=0,
+        ),
+        min_free_disk_bytes=_parse_int_env(
+            "MIN_FREE_DISK_BYTES",
+            DEFAULT_MIN_FREE_DISK_BYTES,
             minimum=0,
         ),
     )

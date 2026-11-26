@@ -1,21 +1,28 @@
-import { type FormEvent, useEffect, useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   ApiError,
-  createJob,
+  cancelJob,
+  deleteJob,
   getAuthStatus,
   getJobStatus,
+  getQueueSnapshot,
   loginWithPassword,
   logout,
+  pauseQueue,
+  reorderQueue,
+  resumeQueue,
+  retryJob,
 } from './api'
 import { HistoryList } from './components/HistoryList'
 import { LiveConsole } from './components/LiveConsole'
-import { UploadBox } from './components/UploadBox'
+import { QueueComposer } from './components/QueueComposer'
+import { QueuePanel } from './components/QueuePanel'
 import {
+  MAX_LOGS_PER_JOB,
+  MAX_LOG_TOKENS,
   POLL_INTERVAL_MS,
-  RECORDING_ACCEPT,
-  RECORDING_EXTENSIONS,
-  SLIDES_ACCEPT,
-  SLIDES_EXTENSIONS,
+  QUEUE_POLL_HIDDEN_INTERVAL_MS,
+  QUEUE_POLL_INTERVAL_MS,
   formatLogTime,
 } from './constants'
 import {
@@ -23,11 +30,32 @@ import {
   createEntryFromUpload,
   extractTokenFromPath,
   loadHistory,
+  mergeHistoryWithServerRecent,
   removeHistoryEntry,
   saveHistory,
   upsertHistoryEntry,
 } from './history'
-import type { ConsoleLogEntry, HistoryEntry, JobStatusResponse } from './types'
+import { useUploadPump } from './hooks/useUploadPump'
+import { autoPairFiles, pairInNaturalOrder } from './pairing'
+import type {
+  ConsoleLogEntry,
+  HistoryEntry,
+  JobCreateResponse,
+  JobStatusResponse,
+  QueueSnapshotResponse,
+  StagedLecturePair,
+  UnpairedFile,
+} from './types'
+
+let unpairedCounter = 0
+
+function makeUnpairedFile(file: File): UnpairedFile {
+  unpairedCounter += 1
+  return {
+    id: `unpaired_${Date.now()}_${unpairedCounter}`,
+    file,
+  }
+}
 
 function mergeStageLogs(
   existing: ConsoleLogEntry[],
@@ -44,7 +72,9 @@ function mergeStageLogs(
         ? 'In progress...'
         : stage.status === 'completed'
           ? 'Completed.'
-          : 'Failed.')
+          : stage.status === 'cancelled'
+            ? 'Cancelled.'
+            : 'Failed.')
     const key = `${stage.stage}:${stage.status}:${message}`
     if (seen.has(key)) continue
     seen.add(key)
@@ -58,7 +88,42 @@ function mergeStageLogs(
     })
   }
 
-  return additions.length > 0 ? [...existing, ...additions] : existing
+  if (additions.length === 0) return existing
+  const combined = [...existing, ...additions]
+  return combined.length > MAX_LOGS_PER_JOB
+    ? combined.slice(combined.length - MAX_LOGS_PER_JOB)
+    : combined
+}
+
+function updateLogsWithCap(
+  prev: Record<string, ConsoleLogEntry[]>,
+  token: string,
+  nextEntries: ConsoleLogEntry[],
+): Record<string, ConsoleLogEntry[]> {
+  const cappedEntries =
+    nextEntries.length > MAX_LOGS_PER_JOB
+      ? nextEntries.slice(nextEntries.length - MAX_LOGS_PER_JOB)
+      : nextEntries
+
+  if (prev[token] === cappedEntries) return prev
+
+  const next: Record<string, ConsoleLogEntry[]> = {}
+  for (const [key, value] of Object.entries(prev)) {
+    if (key !== token) {
+      next[key] = value
+    }
+  }
+  next[token] = cappedEntries
+
+  const keys = Object.keys(next)
+  if (keys.length > MAX_LOG_TOKENS) {
+    const excess = keys.length - MAX_LOG_TOKENS
+    for (let i = 0; i < excess; i += 1) {
+      delete next[keys[i]]
+    }
+  }
+
+  return next
 }
 
 export function App() {
@@ -72,15 +137,24 @@ export function App() {
 
   const [recordingFile, setRecordingFile] = useState<File | null>(null)
   const [slidesFile, setSlidesFile] = useState<File | null>(null)
-  const [isSubmitting, setIsSubmitting] = useState(false)
-  const [uploadLogs, setUploadLogs] = useState<ConsoleLogEntry[]>([])
+  const [unpairedRecordings, setUnpairedRecordings] = useState<UnpairedFile[]>([])
+  const [unpairedSlides, setUnpairedSlides] = useState<UnpairedFile[]>([])
+  const [rejectedFiles, setRejectedFiles] = useState<string[]>([])
   const [uploadError, setUploadError] = useState<string | null>(null)
 
-  const [activeToken, setActiveToken] = useState<string | null>(() =>
+  const [queue, setQueue] = useState<QueueSnapshotResponse | null>(null)
+  const [queueRefreshNonce, setQueueRefreshNonce] = useState(0)
+  const [queueControlBusy, setQueueControlBusy] = useState(false)
+  const [queueControlError, setQueueControlError] = useState<string | null>(null)
+
+  const [selectedToken, setSelectedToken] = useState<string | null>(() =>
     extractTokenFromPath(window.location.pathname),
   )
+  const [autoFollowActive, setAutoFollowActive] = useState<boolean>(
+    () => !extractTokenFromPath(window.location.pathname),
+  )
   const [reloadNonce, setReloadNonce] = useState(0)
-  const [job, setJob] = useState<JobStatusResponse | null>(null)
+  const [inspectedJob, setInspectedJob] = useState<JobStatusResponse | null>(null)
   const [isLoadingJob, setIsLoadingJob] = useState<boolean>(() =>
     Boolean(extractTokenFromPath(window.location.pathname)),
   )
@@ -88,9 +162,108 @@ export function App() {
   const [logsByToken, setLogsByToken] = useState<Record<string, ConsoleLogEntry[]>>({})
   const [history, setHistory] = useState<HistoryEntry[]>(() => loadHistory())
 
+  const lastPrimaryTokenRef = useRef<string | null>(null)
+
   const isLocked = authChecked && authRequired && !authenticated
   const canAccessApi = authChecked && (!authRequired || authenticated)
 
+  const handleAuthExpired = useCallback(() => {
+    setAuthRequired(true)
+    setAuthenticated(false)
+    setAuthError('Session expired. Please enter the password to continue.')
+    setPollError(null)
+    setQueueControlError(null)
+  }, [])
+
+  const applyQueueSnapshot = useCallback((snapshot: QueueSnapshotResponse) => {
+    setQueue(snapshot)
+    setQueueControlError(null)
+
+    const primaryJob =
+      snapshot.active.find((item) => item.pipeline_role === 'primary') ??
+      snapshot.active[0] ??
+      null
+
+    if (primaryJob) {
+      lastPrimaryTokenRef.current = primaryJob.token
+    }
+
+    if (snapshot.active.length > 0) {
+      setLogsByToken((prev) => {
+        let updated = prev
+        for (const activeJob of snapshot.active) {
+          const merged = mergeStageLogs(updated[activeJob.token] ?? [], activeJob)
+          updated = updateLogsWithCap(updated, activeJob.token, merged)
+        }
+        return updated
+      })
+    }
+
+    setHistory((prev) => {
+      const merged = mergeHistoryWithServerRecent(
+        prev,
+        snapshot.recent,
+        snapshot.active,
+        snapshot.queued,
+      )
+      saveHistory(merged)
+      return merged
+    })
+  }, [])
+
+  const handleJobEnqueued = useCallback(
+    (created: JobCreateResponse, pair: StagedLecturePair) => {
+      const nowIso = new Date().toISOString()
+      const uploadEntries: ConsoleLogEntry[] = [
+        {
+          key: `upload-complete:${created.token}`,
+          timestamp: formatLogTime(nowIso),
+          stage: 'upload',
+          label: 'Upload',
+          status: 'completed',
+          message: `Uploaded ${pair.recording.name} and ${pair.slides.name}. Queued for processing.`,
+        },
+      ]
+
+      setLogsByToken((prev) => updateLogsWithCap(prev, created.token, uploadEntries))
+
+      setHistory((prev) => {
+        const updated = upsertHistoryEntry(
+          prev,
+          createEntryFromUpload(created, pair.slides.name, pair.recording.name, pair.label),
+        )
+        saveHistory(updated)
+        return updated
+      })
+
+      setSelectedToken((prev) => prev ?? created.token)
+      setAutoFollowActive((prev) => prev || window.location.pathname === '/')
+      setPollError(null)
+      setQueueRefreshNonce((n) => n + 1)
+    },
+    [],
+  )
+
+  const {
+    stagedPairs,
+    hasActiveUploads,
+    remainingUploadCount,
+    allUploadedNotice,
+    stagePairs,
+    enqueueImmediatePair,
+    startAllStagedUploads,
+    moveStagedPair,
+    removeStagedPair,
+    retryStagedPair,
+    clearStagedPairs,
+    dismissAllUploadedNotice,
+  } = useUploadPump({
+    canAccessApi,
+    onJobEnqueued: handleJobEnqueued,
+    onAuthExpired: handleAuthExpired,
+  })
+
+  // Check initial authentication status
   useEffect(() => {
     let cancelled = false
 
@@ -118,11 +291,13 @@ export function App() {
     }
   }, [])
 
+  // Handle browser back/forward navigation
   useEffect(() => {
     const handlePopState = () => {
       const token = extractTokenFromPath(window.location.pathname)
-      setActiveToken(token)
-      setJob(null)
+      setSelectedToken(token)
+      setAutoFollowActive(!token)
+      setInspectedJob(null)
       setPollError(null)
       setIsLoadingJob(Boolean(token))
     }
@@ -131,25 +306,136 @@ export function App() {
     return () => window.removeEventListener('popstate', handlePopState)
   }, [])
 
+  // Consolidated GET /api/queue polling (stops completely when idle)
   useEffect(() => {
-    if (!activeToken || !canAccessApi) return
+    if (!canAccessApi) return
+
+    let cancelled = false
+    let timerId: number | null = null
+    let shouldContinuePolling = false
+
+    const clearTimer = () => {
+      if (timerId !== null) {
+        window.clearTimeout(timerId)
+        timerId = null
+      }
+    }
+
+    const scheduleNext = (delayMs: number) => {
+      clearTimer()
+      timerId = window.setTimeout(() => {
+        void pollQueue()
+      }, delayMs)
+    }
+
+    const pollQueue = async () => {
+      clearTimer()
+      try {
+        const snapshot = await getQueueSnapshot({ recentLimit: 50 })
+        if (cancelled) return
+
+        const hadPrimary = lastPrimaryTokenRef.current
+        applyQueueSnapshot(snapshot)
+
+        // If the primary job just completed/failed and left `active`, keep it selected so
+        // the user sees the final Download .md / error state in LiveConsole.
+        if (hadPrimary && snapshot.active.length === 0) {
+          setSelectedToken((prev) => prev ?? hadPrimary)
+        }
+
+        const hasServerWork = snapshot.active.length > 0 || snapshot.queued.length > 0
+        shouldContinuePolling = hasServerWork
+
+        if (hasServerWork) {
+          const interval = document.hidden
+            ? QUEUE_POLL_HIDDEN_INTERVAL_MS
+            : QUEUE_POLL_INTERVAL_MS
+          scheduleNext(interval)
+        }
+      } catch (err) {
+        if (cancelled) return
+
+        if (err instanceof ApiError && err.status === 401) {
+          handleAuthExpired()
+          return
+        }
+
+        if (shouldContinuePolling) {
+          const retryDelayMs =
+            err instanceof ApiError && err.status === 429
+              ? Math.min(
+                  60_000,
+                  Math.max(QUEUE_POLL_INTERVAL_MS * 2, (err.retryAfterSeconds ?? 5) * 1000),
+                )
+              : QUEUE_POLL_INTERVAL_MS * 2
+          scheduleNext(retryDelayMs)
+        }
+      }
+    }
+
+    const handleVisibilityChange = () => {
+      if (!document.hidden && shouldContinuePolling) {
+        void pollQueue()
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    void pollQueue()
+
+    return () => {
+      cancelled = true
+      clearTimer()
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [canAccessApi, queueRefreshNonce, applyQueueSnapshot, handleAuthExpired])
+
+  const primaryActiveJob = useMemo(() => {
+    if (!queue || queue.active.length === 0) return null
+    return queue.active.find((item) => item.pipeline_role === 'primary') ?? queue.active[0] ?? null
+  }, [queue])
+
+  const effectiveToken = autoFollowActive
+    ? (primaryActiveJob?.token ?? selectedToken)
+    : selectedToken
+
+  const activeJobFromQueue = useMemo(() => {
+    if (!effectiveToken || !queue) return null
+    return queue.active.find((item) => item.token === effectiveToken) ?? null
+  }, [effectiveToken, queue])
+
+  const queuedItemFromQueue = useMemo(() => {
+    if (!effectiveToken || !queue) return null
+    return queue.queued.find((item) => item.token === effectiveToken) ?? null
+  }, [effectiveToken, queue])
+
+  const recentItemFromQueue = useMemo(() => {
+    if (!effectiveToken || !queue) return null
+    return queue.recent.find((item) => item.token === effectiveToken) ?? null
+  }, [effectiveToken, queue])
+
+  const recentUpdatedAt = recentItemFromQueue?.updated_at ?? null
+  const isKnownQueuedInServer = Boolean(queuedItemFromQueue)
+  const isActiveInServer = Boolean(activeJobFromQueue)
+
+  // Fetch GET /api/jobs/{token} only when inspecting a job not currently in queue.active
+  useEffect(() => {
+    if (!effectiveToken || !canAccessApi || isActiveInServer) return
 
     let cancelled = false
     let timerId: number | null = null
 
-    const poll = async () => {
+    const fetchJob = async () => {
       try {
-        const status = await getJobStatus(activeToken)
+        const status = await getJobStatus(effectiveToken)
         if (cancelled) return
 
-        setJob(status)
+        setInspectedJob(status)
         setPollError(null)
         setIsLoadingJob(false)
 
-        setLogsByToken((prev) => ({
-          ...prev,
-          [activeToken]: mergeStageLogs(prev[activeToken] ?? [], status),
-        }))
+        setLogsByToken((prev) =>
+          updateLogsWithCap(prev, effectiveToken, mergeStageLogs(prev[effectiveToken] ?? [], status)),
+        )
 
         setHistory((prev) => {
           const updated = upsertHistoryEntry(prev, createEntryFromStatus(status))
@@ -157,9 +443,14 @@ export function App() {
           return updated
         })
 
-        if (status.status === 'queued' || status.status === 'processing') {
+        // If the job is still queued/processing and not already tracked by queue polling,
+        // continue polling GET /api/jobs/{token} cleanly.
+        if (
+          (status.status === 'queued' || status.status === 'processing') &&
+          !isKnownQueuedInServer
+        ) {
           timerId = window.setTimeout(() => {
-            void poll()
+            void fetchJob()
           }, POLL_INTERVAL_MS)
         }
       } catch (err) {
@@ -167,10 +458,7 @@ export function App() {
         setIsLoadingJob(false)
 
         if (err instanceof ApiError && err.status === 401) {
-          setAuthRequired(true)
-          setAuthenticated(false)
-          setAuthError('Session expired. Please enter the password to continue.')
-          setPollError(null)
+          handleAuthExpired()
           return
         }
 
@@ -182,7 +470,6 @@ export function App() {
               : 'Network error while fetching job status.'
         setPollError(message)
 
-        // Retry transient errors, honoring Retry-After on 429, and stop on 404 Not Found.
         if (!(err instanceof ApiError && err.status === 404)) {
           const retryDelayMs =
             err instanceof ApiError && err.status === 429
@@ -192,13 +479,13 @@ export function App() {
                 )
               : POLL_INTERVAL_MS * 2
           timerId = window.setTimeout(() => {
-            void poll()
+            void fetchJob()
           }, retryDelayMs)
         }
       }
     }
 
-    void poll()
+    void fetchJob()
 
     return () => {
       cancelled = true
@@ -206,9 +493,32 @@ export function App() {
         window.clearTimeout(timerId)
       }
     }
-  }, [activeToken, reloadNonce, canAccessApi])
+  }, [
+    effectiveToken,
+    canAccessApi,
+    isActiveInServer,
+    isKnownQueuedInServer,
+    recentUpdatedAt,
+    reloadNonce,
+    handleAuthExpired,
+  ])
 
-  const canSubmit = Boolean(recordingFile && slidesFile) && !isSubmitting
+  const effectiveJob: JobStatusResponse | null = useMemo(() => {
+    if (activeJobFromQueue) return activeJobFromQueue
+    if (inspectedJob && inspectedJob.token === effectiveToken) {
+      if (queuedItemFromQueue) {
+        return {
+          ...inspectedJob,
+          status: queuedItemFromQueue.status,
+          queue_index: queuedItemFromQueue.queue_index ?? inspectedJob.queue_index,
+          queue_position: queuedItemFromQueue.queue_position ?? inspectedJob.queue_position,
+          waiting_reason: queuedItemFromQueue.waiting_reason ?? inspectedJob.waiting_reason,
+        }
+      }
+      return inspectedJob
+    }
+    return null
+  }, [activeJobFromQueue, inspectedJob, effectiveToken, queuedItemFromQueue])
 
   const handleLoginSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()
@@ -225,6 +535,7 @@ export function App() {
       setAuthError(null)
       setPollError(null)
       setUploadError(null)
+      setQueueControlError(null)
     } catch (err) {
       const message =
         err instanceof Error ? err.message : 'Invalid password. Please try again.'
@@ -249,91 +560,295 @@ export function App() {
       setAuthError(null)
       setUploadError(null)
       setPollError(null)
+      setQueueControlError(null)
       setIsLoggingOut(false)
     }
   }
 
-  const handleStartProcessing = async () => {
-    if (!recordingFile || !slidesFile || isSubmitting) return
-
-    setIsSubmitting(true)
+  const handleRecordingChange = (file: File | null) => {
     setUploadError(null)
-    const uploadLog: ConsoleLogEntry = {
-      key: `upload-start:${Date.now()}`,
-      timestamp: formatLogTime(new Date().toISOString()),
-      stage: 'upload',
-      label: 'Upload',
-      status: 'running',
-      message: `Uploading ${recordingFile.name} and ${slidesFile.name}. Keep this tab open until the upload finishes.`,
-    }
-    setUploadLogs([uploadLog])
+    dismissAllUploadedNotice()
+    setRecordingFile(file)
+  }
 
-    try {
-      const created = await createJob(slidesFile, recordingFile)
-      setLogsByToken((prev) => ({
-        ...prev,
-        [created.token]: [uploadLog, {
-          ...uploadLog,
-          key: `upload-complete:${created.token}`,
-          timestamp: formatLogTime(new Date().toISOString()),
-          status: 'completed',
-          message: 'Upload complete. Waiting for processing updates...',
-        }],
-      }))
-      const nextUrl = created.result_url || `/jobs/${created.token}`
+  const handleSlidesChange = (file: File | null) => {
+    setUploadError(null)
+    dismissAllUploadedNotice()
+    setSlidesFile(file)
+  }
 
-      window.history.pushState({ token: created.token }, '', nextUrl)
+  const handleStageCurrentPair = () => {
+    if (!recordingFile || !slidesFile) return
+    setUploadError(null)
+    stagePairs([{ recording: recordingFile, slides: slidesFile }])
+    setRecordingFile(null)
+    setSlidesFile(null)
+  }
 
-      setHistory((prev) => {
-        const updated = upsertHistoryEntry(
-          prev,
-          createEntryFromUpload(created, slidesFile.name, recordingFile.name),
-        )
-        saveHistory(updated)
-        return updated
-      })
+  const handleSubmitImmediate = () => {
+    if (!recordingFile || !slidesFile) return
+    setUploadError(null)
+    setAutoFollowActive(true)
+    enqueueImmediatePair(recordingFile, slidesFile)
+    setRecordingFile(null)
+    setSlidesFile(null)
+  }
 
-      setJob(null)
-      setPollError(null)
-      setIsLoadingJob(true)
-      setActiveToken(created.token)
+  const handleStartStagedUploads = () => {
+    setUploadError(null)
+    setAutoFollowActive(true)
+    const extraPair =
+      recordingFile && slidesFile ? { recording: recordingFile, slides: slidesFile } : null
+    startAllStagedUploads(extraPair)
+    if (extraPair) {
       setRecordingFile(null)
       setSlidesFile(null)
-    } catch (err) {
-      if (err instanceof ApiError && err.status === 401) {
-        setAuthRequired(true)
-        setAuthenticated(false)
-        setAuthError('Session expired. Please enter the password to continue.')
-        setUploadError(null)
-        return
-      }
-      const message =
-        err instanceof Error ? err.message : 'Upload failed. Please try again.'
-      setUploadError(message)
-    } finally {
-      setIsSubmitting(false)
     }
   }
 
-  const handleSelectHistory = (token: string) => {
+  const handleBulkFilesDrop = (files: File[]) => {
+    setUploadError(null)
+    dismissAllUploadedNotice()
+
+    const existingRecs = [
+      ...(recordingFile ? [recordingFile] : []),
+      ...unpairedRecordings.map((item) => item.file),
+    ]
+    const existingSlides = [
+      ...(slidesFile ? [slidesFile] : []),
+      ...unpairedSlides.map((item) => item.file),
+    ]
+
+    const result = autoPairFiles(files, existingRecs, existingSlides)
+
+    if (result.rejected.length > 0) {
+      setRejectedFiles(result.rejected.map((file) => file.name))
+    }
+
+    if (result.pairs.length > 0) {
+      stagePairs(result.pairs.map((p) => ({ recording: p.recording, slides: p.slides })))
+      setRecordingFile(null)
+      setSlidesFile(null)
+      setUnpairedRecordings(result.unpairedRecordings.map(makeUnpairedFile))
+      setUnpairedSlides(result.unpairedSlides.map(makeUnpairedFile))
+      return
+    }
+
+    // No new pairs yet: populate the 2 single-file boxes when at most 1 of each exists.
+    if (result.unpairedRecordings.length <= 1 && result.unpairedSlides.length <= 1) {
+      setRecordingFile(result.unpairedRecordings[0] ?? null)
+      setSlidesFile(result.unpairedSlides[0] ?? null)
+      setUnpairedRecordings([])
+      setUnpairedSlides([])
+      return
+    }
+
+    setRecordingFile(null)
+    setSlidesFile(null)
+    setUnpairedRecordings(result.unpairedRecordings.map(makeUnpairedFile))
+    setUnpairedSlides(result.unpairedSlides.map(makeUnpairedFile))
+  }
+
+  const handleManualPair = (recordingId: string, slideId: string) => {
+    const recItem = unpairedRecordings.find((item) => item.id === recordingId)
+    const slideItem = unpairedSlides.find((item) => item.id === slideId)
+    if (!recItem || !slideItem) return
+
+    stagePairs([{ recording: recItem.file, slides: slideItem.file }])
+    setUnpairedRecordings((prev) => prev.filter((item) => item.id !== recordingId))
+    setUnpairedSlides((prev) => prev.filter((item) => item.id !== slideId))
+  }
+
+  const handleRemoveUnpairedRecording = (id: string) => {
+    setUnpairedRecordings((prev) => prev.filter((item) => item.id !== id))
+  }
+
+  const handleRemoveUnpairedSlide = (id: string) => {
+    setUnpairedSlides((prev) => prev.filter((item) => item.id !== id))
+  }
+
+  const handlePairRemainingInOrder = () => {
+    const result = pairInNaturalOrder(
+      unpairedRecordings.map((item) => item.file),
+      unpairedSlides.map((item) => item.file),
+    )
+    if (result.pairs.length > 0) {
+      stagePairs(result.pairs)
+    }
+    setUnpairedRecordings(result.remainingRecordings.map(makeUnpairedFile))
+    setUnpairedSlides(result.remainingSlides.map(makeUnpairedFile))
+  }
+
+  const handleSelectJob = (token: string) => {
     const nextUrl = `/jobs/${encodeURIComponent(token)}`
     if (window.location.pathname !== nextUrl) {
       window.history.pushState({ token }, '', nextUrl)
     }
     setUploadError(null)
     setPollError(null)
-    setJob((prev) => (prev?.token === token ? prev : null))
-    setIsLoadingJob(true)
-    setActiveToken(token)
-    setReloadNonce((n) => n + 1)
+    setSelectedToken(token)
+    setAutoFollowActive(primaryActiveJob?.token === token)
+    const inActive = queue?.active.some((item) => item.token === token) ?? false
+    if (!inActive) {
+      setInspectedJob((prev) => (prev?.token === token ? prev : null))
+      setIsLoadingJob(true)
+      setReloadNonce((n) => n + 1)
+    } else {
+      setIsLoadingJob(false)
+    }
+  }
+
+  const handleFollowActive = () => {
+    setAutoFollowActive(true)
+    if (primaryActiveJob) {
+      setSelectedToken(primaryActiveJob.token)
+    }
+    setPollError(null)
+    if (window.location.pathname !== '/') {
+      window.history.pushState({}, '', '/')
+    }
+  }
+
+  const handlePauseQueue = async () => {
+    if (queueControlBusy) return
+    setQueueControlBusy(true)
+    setQueueControlError(null)
+    try {
+      const updated = await pauseQueue()
+      applyQueueSnapshot(updated)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleAuthExpired()
+        return
+      }
+      setQueueControlError(err instanceof Error ? err.message : 'Failed to pause queue.')
+    } finally {
+      setQueueControlBusy(false)
+    }
+  }
+
+  const handleResumeQueue = async () => {
+    if (queueControlBusy) return
+    setQueueControlBusy(true)
+    setQueueControlError(null)
+    try {
+      const updated = await resumeQueue()
+      applyQueueSnapshot(updated)
+      setQueueRefreshNonce((n) => n + 1)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleAuthExpired()
+        return
+      }
+      setQueueControlError(err instanceof Error ? err.message : 'Failed to resume queue.')
+    } finally {
+      setQueueControlBusy(false)
+    }
+  }
+
+  const handleMoveQueued = async (token: string, direction: -1 | 1) => {
+    if (!queue || queueControlBusy) return
+    const tokens = queue.queued.map((item) => item.token)
+    const index = tokens.indexOf(token)
+    const targetIndex = index + direction
+    if (index === -1 || targetIndex < 0 || targetIndex >= tokens.length) return
+
+    const nextTokens = tokens.slice()
+    const [moved] = nextTokens.splice(index, 1)
+    nextTokens.splice(targetIndex, 0, moved)
+
+    setQueueControlBusy(true)
+    setQueueControlError(null)
+    try {
+      const updated = await reorderQueue(nextTokens)
+      applyQueueSnapshot(updated)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleAuthExpired()
+        return
+      }
+      setQueueControlError(err instanceof Error ? err.message : 'Failed to reorder queue.')
+    } finally {
+      setQueueControlBusy(false)
+    }
+  }
+
+  const handleCancelJob = async (token: string) => {
+    if (queueControlBusy) return
+    setQueueControlBusy(true)
+    setQueueControlError(null)
+    try {
+      const updatedJob = await cancelJob(token)
+      if (inspectedJob?.token === token || effectiveToken === token) {
+        setInspectedJob(updatedJob)
+      }
+      setHistory((prev) => {
+        const next = upsertHistoryEntry(prev, createEntryFromStatus(updatedJob))
+        saveHistory(next)
+        return next
+      })
+      setQueueRefreshNonce((n) => n + 1)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleAuthExpired()
+        return
+      }
+      setQueueControlError(err instanceof Error ? err.message : 'Failed to cancel job.')
+    } finally {
+      setQueueControlBusy(false)
+    }
+  }
+
+  const handleRetryJob = async (token: string) => {
+    if (queueControlBusy) return
+    setQueueControlBusy(true)
+    setQueueControlError(null)
+    try {
+      const retriedJob = await retryJob(token, { fromScratch: false, position: 'end' })
+      if (inspectedJob?.token === token || effectiveToken === token) {
+        setInspectedJob(retriedJob)
+      }
+      setHistory((prev) => {
+        const next = upsertHistoryEntry(prev, createEntryFromStatus(retriedJob))
+        saveHistory(next)
+        return next
+      })
+      setPollError(null)
+      setQueueRefreshNonce((n) => n + 1)
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 401) {
+        handleAuthExpired()
+        return
+      }
+      setQueueControlError(err instanceof Error ? err.message : 'Failed to retry job.')
+    } finally {
+      setQueueControlBusy(false)
+    }
   }
 
   const handleRemoveHistory = (token: string) => {
+    const entry = history.find((item) => item.token === token)
     setHistory((prev) => {
       const updated = removeHistoryEntry(prev, token)
       saveHistory(updated)
       return updated
     })
+
+    const isTerminal =
+      entry &&
+      (entry.status === 'completed' ||
+        entry.status === 'failed' ||
+        entry.status === 'cancelled')
+
+    if (canAccessApi && isTerminal && entry.source === 'server') {
+      void deleteJob(token)
+        .then(() => {
+          setQueueRefreshNonce((n) => n + 1)
+        })
+        .catch(() => {
+          // Ignore 404/409 cleanup errors for already-removed or local-only jobs.
+        })
+    }
   }
 
   const handleClearHistory = () => {
@@ -342,8 +857,9 @@ export function App() {
   }
 
   const handleNewUpload = () => {
-    setActiveToken(null)
-    setJob(null)
+    setSelectedToken(null)
+    setAutoFollowActive(false)
+    setInspectedJob(null)
     setPollError(null)
     setIsLoadingJob(false)
     setUploadError(null)
@@ -354,7 +870,30 @@ export function App() {
     }
   }
 
-  const activeLogs = activeToken ? (logsByToken[activeToken] ?? []) : []
+  const queueHasWork = Boolean(queue && (queue.active.length > 0 || queue.queued.length > 0))
+  const showQueuePanel = Boolean(
+    queue && (queue.active.length > 0 || queue.queued.length > 0 || queue.paused),
+  )
+
+  const uploadingPair = stagedPairs.find((pair) => pair.status === 'uploading') ?? null
+  const showUploadingInConsole = Boolean(uploadingPair && !effectiveToken)
+  const uploadConsoleLogs: ConsoleLogEntry[] = uploadingPair
+    ? [
+        {
+          key: `uploading:${uploadingPair.id}`,
+          timestamp: formatLogTime(new Date().toISOString()),
+          stage: 'upload',
+          label: 'Upload',
+          status: 'running',
+          message: `Uploading ${uploadingPair.recording.name} and ${uploadingPair.slides.name} (${uploadingPair.uploadPct}%). Keep this tab open until the upload finishes.`,
+        },
+      ]
+    : []
+
+  const activeLogs = effectiveToken ? (logsByToken[effectiveToken] ?? []) : []
+  const isFollowingThisJob = Boolean(
+    primaryActiveJob && effectiveToken === primaryActiveJob.token && autoFollowActive,
+  )
 
   return (
     <div className="app-shell">
@@ -363,7 +902,8 @@ export function App() {
           <div>
             <h1 className="app-header__title">slidenoteLM</h1>
             <p className="app-header__subtitle">
-              Upload a lecture recording and slides PDF to generate aligned Markdown study notes.
+              Queue one or more lecture recordings and slides PDFs to generate aligned Markdown
+              study notes.
             </p>
           </div>
           {authChecked && authRequired && authenticated ? (
@@ -426,71 +966,75 @@ export function App() {
           </section>
         ) : (
           <>
-            <section className="panel upload-panel" aria-label="Upload files">
-              <div className="upload-grid">
-                <UploadBox
-                  title="Video / Audio"
-                  subtitle="MP4, MOV, MKV, WEBM, MP3, WAV, M4A, and more"
-                  accept={RECORDING_ACCEPT}
-                  allowedExtensions={RECORDING_EXTENSIONS}
-                  invalidTypeMessage="Please select a supported video or audio file (.mp4, .mov, .mkv, .webm, .avi, .m4v, .mp3, .wav, .m4a, .aac, .ogg, .flac, .opus)."
-                  file={recordingFile}
-                  disabled={isSubmitting}
-                  onFileChange={(file) => {
-                    setUploadError(null)
-                    setRecordingFile(file)
-                  }}
-                />
+            <QueueComposer
+              recordingFile={recordingFile}
+              slidesFile={slidesFile}
+              stagedPairs={stagedPairs}
+              unpairedRecordings={unpairedRecordings}
+              unpairedSlides={unpairedSlides}
+              rejectedFiles={rejectedFiles}
+              queueHasWork={queueHasWork}
+              hasActiveUploads={hasActiveUploads}
+              remainingUploadCount={remainingUploadCount}
+              uploadError={uploadError}
+              allUploadedNotice={allUploadedNotice}
+              onRecordingChange={handleRecordingChange}
+              onSlidesChange={handleSlidesChange}
+              onBulkFilesDrop={handleBulkFilesDrop}
+              onStageCurrentPair={handleStageCurrentPair}
+              onSubmitImmediate={handleSubmitImmediate}
+              onStartStagedUploads={handleStartStagedUploads}
+              onMoveStagedPair={moveStagedPair}
+              onRemoveStagedPair={removeStagedPair}
+              onRetryStagedPair={retryStagedPair}
+              onClearStaged={clearStagedPairs}
+              onManualPair={handleManualPair}
+              onRemoveUnpairedRecording={handleRemoveUnpairedRecording}
+              onRemoveUnpairedSlide={handleRemoveUnpairedSlide}
+              onPairRemainingInOrder={handlePairRemainingInOrder}
+              onDismissRejected={() => setRejectedFiles([])}
+            />
 
-                <UploadBox
-                  title="Slides PDF"
-                  subtitle="PDF document (.pdf)"
-                  accept={SLIDES_ACCEPT}
-                  allowedExtensions={SLIDES_EXTENSIONS}
-                  invalidTypeMessage="Please select a valid .pdf slides file."
-                  file={slidesFile}
-                  disabled={isSubmitting}
-                  onFileChange={(file) => {
-                    setUploadError(null)
-                    setSlidesFile(file)
-                  }}
-                />
-              </div>
+            {showQueuePanel && queue ? (
+              <QueuePanel
+                queue={queue}
+                selectedToken={effectiveToken}
+                isControlBusy={queueControlBusy}
+                controlError={queueControlError}
+                onSelect={handleSelectJob}
+                onPause={() => void handlePauseQueue()}
+                onResume={() => void handleResumeQueue()}
+                onMoveQueued={(token, dir) => void handleMoveQueued(token, dir)}
+                onCancel={(token) => void handleCancelJob(token)}
+              />
+            ) : null}
 
-              {uploadError ? (
-                <div className="alert alert--error" role="alert">
-                  {uploadError}
-                </div>
-              ) : null}
-
-              <div className="upload-panel__footer">
-                <button
-                  type="button"
-                  className="btn btn--primary"
-                  disabled={!canSubmit}
-                  onClick={() => void handleStartProcessing()}
-                >
-                  {isSubmitting ? 'Uploading...' : 'Generate Notes'}
-                </button>
-              </div>
-            </section>
-
-            {isSubmitting || activeToken ? (
+            {showUploadingInConsole || effectiveToken ? (
               <LiveConsole
-                token={isSubmitting ? null : activeToken}
-                isUploading={isSubmitting}
-                job={isSubmitting ? null : job}
-                logs={isSubmitting ? uploadLogs : activeLogs}
-                isLoading={isLoadingJob}
-                pollError={isSubmitting ? null : pollError}
+                token={showUploadingInConsole ? null : effectiveToken}
+                isUploading={showUploadingInConsole}
+                job={showUploadingInConsole ? null : effectiveJob}
+                logs={showUploadingInConsole ? uploadConsoleLogs : activeLogs}
+                isLoading={!showUploadingInConsole && !effectiveJob && isLoadingJob}
+                pollError={showUploadingInConsole ? null : pollError}
+                autoFollowActive={autoFollowActive}
+                hasActiveJob={Boolean(primaryActiveJob)}
+                isFollowingThisJob={isFollowingThisJob}
+                totalQueued={queue?.counts.queued ?? 0}
+                isActionBusy={queueControlBusy}
+                onFollowActive={handleFollowActive}
+                onCancel={(token) => void handleCancelJob(token)}
+                onRetry={(token) => void handleRetryJob(token)}
                 onNewUpload={handleNewUpload}
               />
             ) : null}
 
             <HistoryList
               entries={history}
-              activeToken={activeToken}
-              onSelect={handleSelectHistory}
+              activeToken={effectiveToken}
+              isActionBusy={queueControlBusy}
+              onSelect={handleSelectJob}
+              onRetry={(token) => void handleRetryJob(token)}
               onRemove={handleRemoveHistory}
               onClearAll={handleClearHistory}
             />

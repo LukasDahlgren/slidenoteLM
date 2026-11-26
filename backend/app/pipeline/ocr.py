@@ -20,7 +20,9 @@ from google import genai
 from google.genai import types
 
 from ..config import (
+    DEFAULT_GEMINI_COMBINED_RATE_LIMIT_RPM,
     DEFAULT_OCR_GLOBAL_MAX_CONCURRENT,
+    DEFAULT_OCR_MAX_PAGES_PER_BATCH,
     DEFAULT_OCR_MODEL_GOOGLE,
     DEFAULT_OCR_PARALLEL_WORKERS,
     DEFAULT_OCR_THINKING_LEVEL,
@@ -39,6 +41,7 @@ from ..schemas import (
 from .gemini_client import (
     build_thinking_config,
     extract_retry_after_seconds as _shared_extract_retry_after_seconds,
+    get_global_gemini_combined_rate_limiter,
     supports_thinking_level,
 )
 
@@ -49,7 +52,6 @@ SleepFn = Callable[[float], None]
 JitterFn = Callable[[float, float], float]
 
 DEFAULT_OCR_MODEL = DEFAULT_OCR_MODEL_GOOGLE
-DEFAULT_OCR_MAX_PAGES_PER_BATCH = 20
 DEFAULT_OCR_MAX_BATCH_BYTES = 18 * 1024 * 1024  # Safely below Gemini's 20 MB inline payload limit
 DEFAULT_OCR_PARALLEL_MIN_PAGES = 4
 DEFAULT_OCR_RATE_LIMIT_RPM = 20
@@ -191,6 +193,7 @@ def validate_gemini_credentials(settings: Settings) -> None:
                     "with valid Google Cloud Application Default Credentials, or set "
                     "GOOGLE_GENAI_USE_VERTEXAI=false and provide GEMINI_API_KEY."
                 ),
+                fatal_for_queue=True,
             )
         return
 
@@ -203,6 +206,7 @@ def validate_gemini_credentials(settings: Settings) -> None:
                 "(or set GOOGLE_GENAI_USE_VERTEXAI=true and GOOGLE_CLOUD_PROJECT for Vertex AI), "
                 "restart the backend, and retry. Slide OCR does not fall back to plain text extraction."
             ),
+            fatal_for_queue=True,
         )
 
 
@@ -1021,6 +1025,7 @@ def _ocr_single_batch_once(
     thinking_level: str = DEFAULT_OCR_THINKING_LEVEL,
     semaphore: threading.BoundedSemaphore,
     rate_limiter: OutboundRateLimiter | None = None,
+    combined_rate_limiter: OutboundRateLimiter | None = None,
     batch_label: str = "",
     progress_callback: ProgressCallback | None = None,
     sleep_fn: SleepFn = time.sleep,
@@ -1054,6 +1059,19 @@ def _ocr_single_batch_once(
                 progress_callback(wait_msg)
 
         rate_limiter.acquire(sleep_fn=sleep_fn, on_wait=_notify_wait)
+
+    if combined_rate_limiter is not None:
+        def _notify_combined_wait(wait_seconds: float) -> None:
+            wait_msg = (
+                f"Shared Gemini quota pacing ({batch_label}); waiting {wait_seconds:.1f}s..."
+                if batch_label
+                else f"Shared Gemini quota pacing; waiting {wait_seconds:.1f}s..."
+            )
+            logger.info("%s", wait_msg)
+            if progress_callback is not None:
+                progress_callback(wait_msg)
+
+        combined_rate_limiter.acquire(sleep_fn=sleep_fn, on_wait=_notify_combined_wait)
 
     with semaphore:
         response = client.models.generate_content(
@@ -1089,10 +1107,12 @@ def _ocr_single_batch_with_retries(
     model: str,
     semaphore: threading.BoundedSemaphore,
     rate_limiter: OutboundRateLimiter | None = None,
+    combined_rate_limiter: OutboundRateLimiter | None = None,
     progress_callback: ProgressCallback | None = None,
     warnings: list[str] | None = None,
     warnings_lock: threading.Lock | None = None,
     sleep_fn: SleepFn = time.sleep,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[dict[str, Any]], int, int]:
     attempts = _get_setting_int(settings, "ocr_retry_attempts", DEFAULT_OCR_RETRY_ATTEMPTS)
     base_delay = _get_setting_float(
@@ -1124,7 +1144,26 @@ def _ocr_single_batch_with_retries(
         else:
             warnings.append(note)
 
+    def _check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StageError(
+                stage="ocr",
+                message="Slide OCR cancelled by user.",
+                hint="Retry the lecture if you still want Markdown notes.",
+            )
+
+    def _effective_sleep(seconds: float) -> None:
+        _check_cancelled()
+        if seconds <= 0:
+            return
+        if cancel_event is not None and sleep_fn is time.sleep:
+            cancel_event.wait(timeout=seconds)
+        else:
+            sleep_fn(seconds)
+        _check_cancelled()
+
     for attempt in range(1, attempts + 1):
+        _check_cancelled()
         try:
             raw_slides, input_tokens, output_tokens = _ocr_single_batch_once(
                 client,
@@ -1134,9 +1173,10 @@ def _ocr_single_batch_with_retries(
                 thinking_level=thinking_level,
                 semaphore=semaphore,
                 rate_limiter=rate_limiter,
+                combined_rate_limiter=combined_rate_limiter,
                 batch_label=batch_label,
                 progress_callback=progress_callback,
-                sleep_fn=sleep_fn,
+                sleep_fn=_effective_sleep,
             )
             normalized_slides, mismatch_warning = normalize_batch_slides(
                 raw_slides,
@@ -1161,6 +1201,7 @@ def _ocr_single_batch_with_retries(
                         f"Google Gemini OCR authentication failed ({batch_label}: {exc})."
                     ),
                     hint=_auth_error_hint(settings),
+                    fatal_for_queue=True,
                 ) from exc
             if is_payload_too_large_error(exc):
                 raise StageError(
@@ -1210,7 +1251,7 @@ def _ocr_single_batch_with_retries(
             if progress_callback is not None:
                 progress_callback(retry_msg)
             if delay > 0:
-                sleep_fn(delay)
+                _effective_sleep(delay)
 
     raise AssertionError("Unreachable retry loop exit.")  # pragma: no cover
 
@@ -1224,6 +1265,7 @@ def extract_slides_with_gemini_ocr(
     client_factory: GenAIClientFactory | None = None,
     rate_limiter: OutboundRateLimiter | None = None,
     sleep_fn: SleepFn = time.sleep,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[SlidesOCRArtifact, list[str], dict[str, int]]:
     """Run strict Google Gemini OCR across a slide PDF and return the structured artifact."""
     validate_gemini_credentials(settings)
@@ -1290,16 +1332,25 @@ def extract_slides_with_gemini_ocr(
         DEFAULT_OCR_RATE_LIMIT_RPM,
         minimum=0,
     )
+    combined_rpm = _get_setting_int(
+        settings,
+        "gemini_combined_rate_limit_rpm",
+        DEFAULT_GEMINI_COMBINED_RATE_LIMIT_RPM,
+        minimum=0,
+    )
     if rate_limiter is not None:
         resolved_rate_limiter: OutboundRateLimiter | None = rate_limiter
+        combined_rate_limiter: OutboundRateLimiter | None = None
     elif client_factory is not None:
         resolved_rate_limiter = (
             OutboundRateLimiter(max_requests=ocr_rate_limit_rpm, window_seconds=60.0)
             if ocr_rate_limit_rpm > 0
             else None
         )
+        combined_rate_limiter = None
     else:
         resolved_rate_limiter = _get_global_ocr_rate_limiter(ocr_rate_limit_rpm)
+        combined_rate_limiter = get_global_gemini_combined_rate_limiter(combined_rpm)
     warnings: list[str] = []
     warnings_lock = threading.Lock()
     progress_lock = threading.Lock()
@@ -1326,10 +1377,12 @@ def extract_slides_with_gemini_ocr(
             model=model,
             semaphore=semaphore,
             rate_limiter=resolved_rate_limiter,
+            combined_rate_limiter=combined_rate_limiter,
             progress_callback=progress_callback,
             warnings=warnings,
             warnings_lock=warnings_lock,
             sleep_fn=sleep_fn,
+            cancel_event=cancel_event,
         )
         return payload.spec.page_start, slides, in_tok, out_tok
 
@@ -1418,6 +1471,7 @@ def run_ocr_stage(context: JobContext, settings: Settings) -> StageResult:
         settings,
         source_pdf=context.slides_filename,
         progress_callback=context.report_progress,
+        cancel_event=context.cancel_event,
     )
 
     context.slides_ocr_path.parent.mkdir(parents=True, exist_ok=True)

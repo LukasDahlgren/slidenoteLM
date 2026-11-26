@@ -10,7 +10,9 @@ interface UploadBoxProps {
   invalidTypeMessage: string
   file: File | null
   disabled?: boolean
+  multiple?: boolean
   onFileChange: (file: File | null) => void
+  onFilesSelect?: (files: File[]) => void
 }
 
 export function UploadBox({
@@ -21,14 +23,26 @@ export function UploadBox({
   invalidTypeMessage,
   file,
   disabled = false,
+  multiple = false,
   onFileChange,
+  onFilesSelect,
 }: UploadBoxProps) {
   const inputId = useId()
   const inputRef = useRef<HTMLInputElement | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [validationError, setValidationError] = useState<string | null>(null)
 
-  const handleSelectedFile = (candidate: File | null) => {
+  const handleSelectedFiles = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return
+    const files = Array.from(fileList)
+
+    if (files.length > 1 && onFilesSelect) {
+      setValidationError(null)
+      onFilesSelect(files)
+      return
+    }
+
+    const candidate = files[0]
     if (!candidate) return
     if (!hasAllowedExtension(candidate.name, allowedExtensions)) {
       setValidationError(invalidTypeMessage)
@@ -39,8 +53,7 @@ export function UploadBox({
   }
 
   const handleInputChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const candidate = event.target.files?.[0] ?? null
-    handleSelectedFile(candidate)
+    handleSelectedFiles(event.target.files)
     event.target.value = ''
   }
 
@@ -60,10 +73,10 @@ export function UploadBox({
 
   const handleDrop = (event: DragEvent<HTMLDivElement>) => {
     event.preventDefault()
+    event.stopPropagation()
     setIsDragging(false)
     if (disabled) return
-    const candidate = event.dataTransfer.files?.[0] ?? null
-    handleSelectedFile(candidate)
+    handleSelectedFiles(event.dataTransfer.files)
   }
 
   const triggerPicker = () => {
@@ -108,6 +121,7 @@ export function UploadBox({
           id={inputId}
           type="file"
           accept={accept}
+          multiple={multiple}
           aria-label={`${title} file input`}
           className="sr-only"
           disabled={disabled}
@@ -141,7 +155,9 @@ export function UploadBox({
           </div>
         ) : (
           <div className="upload-box__placeholder">
-            <span className="upload-box__prompt">Drop file here or click to browse</span>
+            <span className="upload-box__prompt">
+              {multiple ? 'Drop file(s) here or click to browse' : 'Drop file here or click to browse'}
+            </span>
             <span className="upload-box__hint">{subtitle}</span>
           </div>
         )}

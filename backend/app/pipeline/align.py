@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, Callable, Sequence
 
@@ -1059,6 +1060,7 @@ def _align_with_gemini(
     *,
     client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[list[dict[str, Any]], tuple[int, int, int]]:
     """Run live slide-to-transcript alignment using Google Gemini."""
     if not transcript.segments:
@@ -1113,6 +1115,7 @@ def _align_with_gemini(
         parse_fn=parse_alignment_response,
         client_factory=client_factory,
         progress_callback=progress_callback,
+        cancel_event=cancel_event,
     )
 
     parsed_entries = result.parsed
@@ -1142,6 +1145,7 @@ def align_with_llm(
     client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
     usage_out: dict[str, int] | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> AlignmentArtifact:
     """Align transcript segments to slides via Google Gemini, injected callable, or stub mode."""
     mode = (settings.pipeline_llm_mode or "gemini").strip().lower() or "gemini"
@@ -1207,6 +1211,7 @@ def align_with_llm(
             settings,
             client_factory=client_factory,
             progress_callback=progress_callback,
+            cancel_event=cancel_event,
         )
         if usage_out is not None:
             usage_out["align_input_tokens"] = input_tokens
@@ -1260,6 +1265,7 @@ def run_alignment_stage(
         client_factory=client_factory,
         progress_callback=context.report_progress,
         usage_out=usage,
+        cancel_event=context.cancel_event,
     )
 
     context.alignment_path.parent.mkdir(parents=True, exist_ok=True)

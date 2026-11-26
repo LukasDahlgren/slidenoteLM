@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
 from typing import AsyncIterator
 
-from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile, status
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -21,7 +21,7 @@ from .auth import (
     verify_password,
 )
 from .config import REPO_ROOT, Settings, load_settings
-from .db import JobStore, generate_job_token
+from .db import JobStore, check_job_retry_eligibility, generate_job_token
 from .pipeline import StageHandler
 from .ratelimit import RateLimitMiddleware, SlidingWindowRateLimiter
 from .schemas import (
@@ -29,12 +29,19 @@ from .schemas import (
     PIPELINE_STAGES,
     STAGE_LABELS,
     HealthResponse,
+    JobCancelRequest,
     JobCreateResponse,
     JobErrorResponse,
     JobPreviewResponse,
+    JobRetryRequest,
     JobStatsResponse,
     JobStatusResponse,
+    PipelineRole,
     PipelineStage,
+    QueueCountsResponse,
+    QueueItemResponse,
+    QueueOrderRequest,
+    QueueSnapshotResponse,
     StageStateResponse,
 )
 from .worker import JobWorker
@@ -147,7 +154,23 @@ async def _save_upload_file(
     return total_bytes
 
 
-def _job_to_status_response(job: dict) -> JobStatusResponse:
+def _build_job_error(job: dict) -> JobErrorResponse | None:
+    if job.get("error_stage") and job.get("error_message"):
+        err_stage: PipelineStage = job["error_stage"]
+        return JobErrorResponse(
+            stage=err_stage,
+            stage_label=STAGE_LABELS[err_stage],
+            message=str(job["error_message"]),
+            hint=str(job.get("error_hint") or "Retry the upload or check backend logs."),
+        )
+    return None
+
+
+def _job_to_status_response(
+    job: dict,
+    *,
+    runtime_meta: tuple[PipelineRole | None, str | None] = (None, None),
+) -> JobStatusResponse:
     token = str(job["token"])
     current_stage: PipelineStage = job["current_stage"]
     stages = [
@@ -162,16 +185,7 @@ def _job_to_status_response(job: dict) -> JobStatusResponse:
         for s in job["stages"]
     ]
 
-    error: JobErrorResponse | None = None
-    if job.get("error_stage") and job.get("error_message"):
-        err_stage: PipelineStage = job["error_stage"]
-        error = JobErrorResponse(
-            stage=err_stage,
-            stage_label=STAGE_LABELS[err_stage],
-            message=str(job["error_message"]),
-            hint=str(job.get("error_hint") or "Retry the upload or check backend logs."),
-        )
-
+    error = _build_job_error(job)
     notes_path = _resolve_notes_path(job)
     download_ready = (
         job["status"] == "completed"
@@ -179,6 +193,8 @@ def _job_to_status_response(job: dict) -> JobStatusResponse:
         and notes_path.is_file()
     )
     download_filename = build_download_filename(str(job["slides_filename"]))
+    can_retry, can_retry_from_scratch, _ = check_job_retry_eligibility(job)
+    pipeline_role, waiting_reason = runtime_meta
 
     return JobStatusResponse(
         token=token,
@@ -189,6 +205,12 @@ def _job_to_status_response(job: dict) -> JobStatusResponse:
         progress_pct=_compute_progress_pct(job),
         slides_filename=str(job["slides_filename"]),
         recording_filename=str(job["recording_filename"]),
+        queue_label=job.get("queue_label"),
+        batch_id=job.get("batch_id"),
+        queue_position=job.get("queue_position"),
+        queue_index=job.get("queue_index"),
+        pipeline_role=pipeline_role if job["status"] == "processing" else None,
+        waiting_reason=waiting_reason if job["status"] == "processing" else None,
         created_at=str(job["created_at"]),
         updated_at=str(job["updated_at"]),
         started_at=job.get("started_at"),
@@ -196,11 +218,95 @@ def _job_to_status_response(job: dict) -> JobStatusResponse:
         download_ready=download_ready,
         download_url=f"/api/jobs/{token}/download" if download_ready else None,
         download_filename=download_filename if download_ready else None,
+        can_cancel=job["status"] in {"queued", "processing"},
+        can_retry=can_retry,
+        can_retry_from_scratch=can_retry_from_scratch,
         stages=stages,
         error=error,
         artifacts=dict(job.get("artifacts") or {}),
         stats=JobStatsResponse.model_validate(job.get("stats") or {}),
         warnings=list(job.get("warnings") or []),
+    )
+
+
+def _job_to_queue_item_response(
+    job: dict,
+    *,
+    runtime_meta: tuple[PipelineRole | None, str | None] = (None, None),
+) -> QueueItemResponse:
+    token = str(job["token"])
+    current_stage: PipelineStage = job["current_stage"]
+    notes_path = _resolve_notes_path(job)
+    download_ready = (
+        job["status"] == "completed"
+        and notes_path is not None
+        and notes_path.is_file()
+    )
+    download_filename = build_download_filename(str(job["slides_filename"]))
+    can_retry, can_retry_from_scratch, _ = check_job_retry_eligibility(job)
+    pipeline_role, waiting_reason = runtime_meta
+
+    return QueueItemResponse(
+        token=token,
+        result_url=f"/jobs/{token}",
+        status=job["status"],
+        current_stage=current_stage,
+        current_stage_label=STAGE_LABELS[current_stage],
+        progress_pct=_compute_progress_pct(job),
+        slides_filename=str(job["slides_filename"]),
+        recording_filename=str(job["recording_filename"]),
+        queue_label=job.get("queue_label"),
+        batch_id=job.get("batch_id"),
+        queue_position=job.get("queue_position"),
+        queue_index=job.get("queue_index"),
+        pipeline_role=pipeline_role if job["status"] == "processing" else None,
+        waiting_reason=waiting_reason if job["status"] == "processing" else None,
+        created_at=str(job["created_at"]),
+        updated_at=str(job["updated_at"]),
+        started_at=job.get("started_at"),
+        completed_at=job.get("completed_at"),
+        download_ready=download_ready,
+        download_url=f"/api/jobs/{token}/download" if download_ready else None,
+        download_filename=download_filename if download_ready else None,
+        can_cancel=job["status"] in {"queued", "processing"},
+        can_retry=can_retry,
+        can_retry_from_scratch=can_retry_from_scratch,
+        error=_build_job_error(job),
+        stats=JobStatsResponse.model_validate(job.get("stats") or {}),
+    )
+
+
+def _build_queue_snapshot_response(
+    store: JobStore,
+    worker: JobWorker,
+    settings: Settings,
+    *,
+    recent_limit: int = 50,
+    batch_id: str | None = None,
+) -> QueueSnapshotResponse:
+    snapshot = store.get_queue_snapshot(recent_limit=recent_limit, batch_id=batch_id)
+    runtime_by_token = worker.get_all_runtime_meta()
+
+    active_responses: list[JobStatusResponse] = []
+    for idx, job in enumerate(snapshot["active"]):
+        tok = str(job["token"])
+        default_role: PipelineRole = "primary" if idx == 0 else "preparing"
+        meta = runtime_by_token.get(tok, (default_role, None))
+        active_responses.append(_job_to_status_response(job, runtime_meta=meta))
+
+    queued_responses = [_job_to_queue_item_response(job) for job in snapshot["queued"]]
+    recent_responses = [_job_to_queue_item_response(job) for job in snapshot["recent"]]
+    queue_state = snapshot["queue_state"]
+
+    return QueueSnapshotResponse(
+        paused=bool(queue_state["paused"]),
+        pause_reason=queue_state.get("pause_reason"),
+        max_in_flight_jobs=settings.queue_max_in_flight_jobs,
+        max_queue_depth=settings.max_queue_depth,
+        counts=QueueCountsResponse.model_validate(snapshot["counts"]),
+        active=active_responses,
+        queued=queued_responses,
+        recent=recent_responses,
     )
 
 
@@ -234,7 +340,7 @@ def _require_completed_notes_path(store: JobStore, token: str) -> tuple[dict, Pa
 
 
 class AppPasswordMiddleware:
-    """Enforce optional APP_PASSWORD cookie authentication on /api/jobs* routes."""
+    """Enforce optional APP_PASSWORD cookie authentication on /api/jobs* and /api/queue* routes."""
 
     def __init__(self, app: ASGIApp, settings: Settings) -> None:
         self.app = app
@@ -244,7 +350,13 @@ class AppPasswordMiddleware:
         if scope["type"] == "http" and self.settings.app_password:
             path = scope.get("path", "")
             method = scope.get("method", "GET").upper()
-            if method != "OPTIONS" and (path == "/api/jobs" or path.startswith("/api/jobs/")):
+            is_protected = (
+                path == "/api/jobs"
+                or path.startswith("/api/jobs/")
+                or path == "/api/queue"
+                or path.startswith("/api/queue/")
+            )
+            if method != "OPTIONS" and is_protected:
                 request = Request(scope, receive=receive)
                 if not is_request_authenticated(request, self.settings):
                     response = JSONResponse(
@@ -388,6 +500,8 @@ def create_app(
     async def create_job(
         slides: UploadFile = File(...),
         recording: UploadFile = File(...),
+        batch_id: str | None = Form(default=None),
+        label: str | None = Form(default=None),
     ) -> JobCreateResponse:
         slides_name = sanitize_filename(slides.filename, "slides.pdf")
         recording_name = sanitize_filename(recording.filename, "recording")
@@ -413,6 +527,35 @@ def create_app(
                     f"Allowed formats: {allowed_list}"
                 ),
             )
+
+        if (
+            resolved_settings.max_queue_depth > 0
+            and store.count_active_and_queued_jobs() >= resolved_settings.max_queue_depth
+        ):
+            await slides.close()
+            await recording.close()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Queue is full (maximum {resolved_settings.max_queue_depth} active/queued "
+                    "lectures). Wait for current lectures to finish or cancel queued items."
+                ),
+            )
+
+        if resolved_settings.min_free_disk_bytes > 0:
+            resolved_settings.jobs_dir.mkdir(parents=True, exist_ok=True)
+            free_bytes = shutil.disk_usage(resolved_settings.jobs_dir).free
+            if free_bytes < resolved_settings.min_free_disk_bytes:
+                await slides.close()
+                await recording.close()
+                min_mb = resolved_settings.min_free_disk_bytes // (1024 * 1024)
+                raise HTTPException(
+                    status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+                    detail=(
+                        f"Insufficient free disk space to accept upload (requires at least {min_mb} MB free). "
+                        "Delete old jobs or free disk space and retry."
+                    ),
+                )
 
         token = generate_job_token()
         job_dir = resolved_settings.jobs_dir / token
@@ -453,6 +596,8 @@ def create_app(
                 "recording": recording_rel,
             },
             token=token,
+            batch_id=batch_id,
+            queue_label=label,
         )
         worker.submit(token)
 
@@ -462,7 +607,40 @@ def create_app(
             status=job["status"],
             current_stage=job["current_stage"],
             created_at=str(job["created_at"]),
+            queue_position=job.get("queue_position"),
+            batch_id=job.get("batch_id"),
         )
+
+    @application.get("/api/queue", response_model=QueueSnapshotResponse)
+    def get_queue(
+        recent_limit: int = Query(default=50, ge=0, le=200),
+        batch_id: str | None = Query(default=None),
+    ) -> QueueSnapshotResponse:
+        return _build_queue_snapshot_response(
+            store,
+            worker,
+            resolved_settings,
+            recent_limit=recent_limit,
+            batch_id=batch_id,
+        )
+
+    @application.patch("/api/queue/order", response_model=QueueSnapshotResponse)
+    def reorder_queue(payload: QueueOrderRequest) -> QueueSnapshotResponse:
+        store.reorder_queued_jobs(payload.tokens)
+        worker.notify()
+        return _build_queue_snapshot_response(store, worker, resolved_settings)
+
+    @application.post("/api/queue/pause", response_model=QueueSnapshotResponse)
+    def pause_queue() -> QueueSnapshotResponse:
+        store.set_queue_paused(True, reason=None)
+        worker.notify()
+        return _build_queue_snapshot_response(store, worker, resolved_settings)
+
+    @application.post("/api/queue/resume", response_model=QueueSnapshotResponse)
+    def resume_queue() -> QueueSnapshotResponse:
+        store.set_queue_paused(False, reason=None)
+        worker.notify()
+        return _build_queue_snapshot_response(store, worker, resolved_settings)
 
     @application.get("/api/jobs/{token}", response_model=JobStatusResponse)
     def get_job_status(token: str) -> JobStatusResponse:
@@ -472,7 +650,84 @@ def create_app(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Job not found. Check that your private result link is complete.",
             )
-        return _job_to_status_response(job)
+        return _job_to_status_response(job, runtime_meta=worker.get_runtime_job_meta(token))
+
+    @application.post("/api/jobs/{token}/cancel", response_model=JobStatusResponse)
+    def cancel_job(
+        token: str,
+        payload: JobCancelRequest | None = Body(default=None),
+    ) -> JobStatusResponse:
+        delete_files = payload.delete_files if payload is not None else None
+        outcome, job = worker.cancel_job(token, delete_files=delete_files)
+        if outcome == "not_found" or job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found. Check that your private result link is complete.",
+            )
+        if outcome == "not_cancellable":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Job cannot be cancelled because its status is '{job['status']}'.",
+            )
+        return _job_to_status_response(job, runtime_meta=worker.get_runtime_job_meta(token))
+
+    @application.post(
+        "/api/jobs/{token}/retry",
+        response_model=JobStatusResponse,
+        status_code=status.HTTP_202_ACCEPTED,
+    )
+    def retry_job(
+        token: str,
+        payload: JobRetryRequest | None = Body(default=None),
+    ) -> JobStatusResponse:
+        if (
+            resolved_settings.max_queue_depth > 0
+            and store.count_active_and_queued_jobs() >= resolved_settings.max_queue_depth
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Queue is full (maximum {resolved_settings.max_queue_depth} active/queued "
+                    "lectures). Wait for current lectures to finish or cancel queued items."
+                ),
+            )
+        req = payload or JobRetryRequest()
+        try:
+            job = store.retry_job(
+                token,
+                from_scratch=req.from_scratch,
+                position=req.position,
+            )
+        except KeyError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found. Check that your private result link is complete.",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+
+        worker.submit(token)
+        return _job_to_status_response(job, runtime_meta=worker.get_runtime_job_meta(token))
+
+    @application.delete("/api/jobs/{token}", status_code=status.HTTP_204_NO_CONTENT)
+    def delete_job(token: str) -> Response:
+        try:
+            job_dir = store.delete_job(token)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(exc),
+            ) from exc
+        if job_dir is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Job not found. Check that your private result link is complete.",
+            )
+        shutil.rmtree(job_dir, ignore_errors=True)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.get("/api/jobs/{token}/preview", response_model=JobPreviewResponse)
     def preview_notes(token: str) -> JobPreviewResponse:

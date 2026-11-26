@@ -5,7 +5,9 @@ import type { HistoryEntry } from '../types'
 interface HistoryListProps {
   entries: HistoryEntry[]
   activeToken: string | null
+  isActionBusy?: boolean
   onSelect: (token: string) => void
+  onRetry?: (token: string) => void
   onRemove: (token: string) => void
   onClearAll: () => void
 }
@@ -13,7 +15,9 @@ interface HistoryListProps {
 export function HistoryList({
   entries,
   activeToken,
+  isActionBusy = false,
   onSelect,
+  onRetry,
   onRemove,
   onClearAll,
 }: HistoryListProps) {
@@ -36,8 +40,14 @@ export function HistoryList({
         <ul className="history-list">
           {entries.map((entry) => {
             const isActive = entry.token === activeToken
-            const downloadHref =
-              entry.downloadReady ? (entry.downloadUrl ?? getDownloadUrl(entry.token)) : null
+            const downloadHref = entry.downloadReady
+              ? (entry.downloadUrl ?? getDownloadUrl(entry.token))
+              : null
+            const title = entry.queueLabel || entry.slidesFilename
+            const canRetry =
+              Boolean(onRetry) &&
+              (entry.status === 'failed' || entry.status === 'cancelled') &&
+              Boolean(entry.canRetry)
 
             return (
               <li
@@ -51,8 +61,11 @@ export function HistoryList({
                   aria-current={isActive ? 'true' : undefined}
                 >
                   <div className="history-item__main">
-                    <span className="history-item__title">{entry.slidesFilename}</span>
+                    <span className="history-item__title">{title}</span>
                     <span className="history-item__subtitle">{entry.recordingFilename}</span>
+                    {entry.errorSummary && entry.status === 'failed' ? (
+                      <span className="history-item__error">{entry.errorSummary}</span>
+                    ) : null}
                   </div>
                   <div className="history-item__meta">
                     <span className={`status-badge status-badge--${entry.status}`}>
@@ -63,6 +76,17 @@ export function HistoryList({
                 </button>
 
                 <div className="history-item__actions">
+                  {canRetry && onRetry ? (
+                    <button
+                      type="button"
+                      className="btn btn--ghost btn--sm"
+                      disabled={isActionBusy}
+                      aria-label={`Retry ${title}`}
+                      onClick={() => onRetry(entry.token)}
+                    >
+                      Retry
+                    </button>
+                  ) : null}
                   {downloadHref ? (
                     <a
                       href={downloadHref}

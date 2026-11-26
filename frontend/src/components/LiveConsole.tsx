@@ -9,6 +9,14 @@ interface LiveConsoleProps {
   logs: ConsoleLogEntry[]
   isLoading: boolean
   pollError: string | null
+  autoFollowActive?: boolean
+  hasActiveJob?: boolean
+  isFollowingThisJob?: boolean
+  totalQueued?: number
+  isActionBusy?: boolean
+  onFollowActive?: () => void
+  onCancel?: (token: string) => void
+  onRetry?: (token: string) => void
   onNewUpload: () => void
 }
 
@@ -17,6 +25,7 @@ const STATUS_LABELS: Record<JobStatusResponse['status'], string> = {
   processing: 'Processing',
   completed: 'Completed',
   failed: 'Failed',
+  cancelled: 'Cancelled',
 }
 
 const STAGE_SYMBOL: Record<StageStateResponse['status'], string> = {
@@ -24,6 +33,7 @@ const STAGE_SYMBOL: Record<StageStateResponse['status'], string> = {
   running: '●',
   completed: '✓',
   failed: '✕',
+  cancelled: '⊘',
 }
 
 export function LiveConsole({
@@ -33,6 +43,14 @@ export function LiveConsole({
   logs,
   isLoading,
   pollError,
+  autoFollowActive = false,
+  hasActiveJob = false,
+  isFollowingThisJob = false,
+  totalQueued = 0,
+  isActionBusy = false,
+  onFollowActive,
+  onCancel,
+  onRetry,
   onNewUpload,
 }: LiveConsoleProps) {
   const [copied, setCopied] = useState(false)
@@ -46,9 +64,10 @@ export function LiveConsole({
           status: isUploading && stage === 'upload' ? 'running' : 'pending',
           started_at: null,
           completed_at: null,
-          message: isUploading && stage === 'upload'
-            ? 'Uploading recording and slides. Large recordings may take a while; keep this tab open.'
-            : null,
+          message:
+            isUploading && stage === 'upload'
+              ? 'Uploading recording and slides. Large recordings may take a while; keep this tab open.'
+              : null,
         }))
 
   const sharePath = job?.result_url ?? `/jobs/${token}`
@@ -63,6 +82,16 @@ export function LiveConsole({
       setCopied(false)
     }
   }
+
+  const canCancelJob =
+    Boolean(token && onCancel && job) &&
+    (job?.status === 'queued' || job?.status === 'processing') &&
+    job?.can_cancel !== false
+
+  const canRetryJob =
+    Boolean(token && onRetry && job) &&
+    (job?.status === 'failed' || job?.status === 'cancelled') &&
+    Boolean(job?.can_retry)
 
   return (
     <section className="panel console-panel" aria-label="Live progress console">
@@ -79,7 +108,13 @@ export function LiveConsole({
                 {isUploading ? 'Uploading' : isLoading ? 'Loading' : 'Pending'}
               </span>
             )}
+            {job?.pipeline_role === 'preparing' ? (
+              <span className="status-badge status-badge--preparing">Preparing next</span>
+            ) : null}
             {job ? <span className="console-panel__pct">{job.progress_pct}%</span> : null}
+            {hasActiveJob && autoFollowActive && isFollowingThisJob ? (
+              <span className="console-panel__follow-pill">Following active</span>
+            ) : null}
           </div>
           {job ? (
             <p className="console-panel__files">
@@ -91,25 +126,71 @@ export function LiveConsole({
             </p>
           ) : (
             <p className="console-panel__files">
-              {isUploading ? 'Sending your recording and slides...' : `Job ${token?.slice(0, 12) ?? ''}`}
+              {isUploading
+                ? 'Sending your recording and slides...'
+                : `Job ${token?.slice(0, 12) ?? ''}`}
             </p>
           )}
         </div>
 
-        {token && !isUploading ? <div className="console-panel__actions">
-          <button
-            type="button"
-            className="btn btn--ghost btn--sm"
-            onClick={handleCopyLink}
-            title={sharePath}
-          >
-            {copied ? 'Link copied' : 'Copy link'}
-          </button>
-          <button type="button" className="btn btn--ghost btn--sm" onClick={onNewUpload}>
-            New upload
-          </button>
-        </div> : null}
+        {token && !isUploading ? (
+          <div className="console-panel__actions">
+            {hasActiveJob && (!autoFollowActive || !isFollowingThisJob) && onFollowActive ? (
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
+                onClick={onFollowActive}
+              >
+                Follow active job
+              </button>
+            ) : null}
+            {canRetryJob && token && onRetry ? (
+              <button
+                type="button"
+                className="btn btn--primary btn--sm"
+                disabled={isActionBusy}
+                onClick={() => onRetry(token)}
+              >
+                Retry
+              </button>
+            ) : null}
+            {canCancelJob && token && onCancel ? (
+              <button
+                type="button"
+                className="btn btn--ghost btn--sm"
+                disabled={isActionBusy}
+                onClick={() => onCancel(token)}
+              >
+                Cancel
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="btn btn--ghost btn--sm"
+              onClick={handleCopyLink}
+              title={sharePath}
+            >
+              {copied ? 'Link copied' : 'Copy link'}
+            </button>
+            <button type="button" className="btn btn--ghost btn--sm" onClick={onNewUpload}>
+              New upload
+            </button>
+          </div>
+        ) : null}
       </div>
+
+      {job?.status === 'queued' ? (
+        <div className="alert alert--info" role="status">
+          Queued at position #{job.queue_index ?? 1}
+          {totalQueued > 0 ? ` of ${totalQueued}` : ''} — starts automatically when a slot opens.
+        </div>
+      ) : null}
+
+      {job?.waiting_reason ? (
+        <div className="alert alert--info" role="status">
+          {job.waiting_reason}
+        </div>
+      ) : null}
 
       {pollError ? (
         <div className="alert alert--error" role="alert">
@@ -144,7 +225,10 @@ export function LiveConsole({
             </div>
           ) : (
             logs.map((entry) => (
-              <div key={entry.key} className={`console-log__line console-log__line--${entry.status}`}>
+              <div
+                key={entry.key}
+                className={`console-log__line console-log__line--${entry.status}`}
+              >
                 <span className="console-log__time">[{entry.timestamp}]</span>{' '}
                 <span className="console-log__stage">{entry.label}:</span>{' '}
                 <span>{entry.message}</span>
@@ -162,6 +246,12 @@ export function LiveConsole({
               <li key={`${index}-${warning}`}>{warning}</li>
             ))}
           </ul>
+        </div>
+      ) : null}
+
+      {job?.status === 'cancelled' ? (
+        <div className="alert alert--muted" role="status">
+          This lecture job was cancelled.
         </div>
       ) : null}
 

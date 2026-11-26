@@ -310,11 +310,31 @@ def _transcribe_single_file_with_retries(
     warnings: list[str] | None = None,
     warnings_lock: threading.Lock | None = None,
     sleep_fn: SleepFn = time.sleep,
+    cancel_event: threading.Event | None = None,
 ) -> list[dict[str, Any]]:
     attempts = max(1, settings.transcribe_retry_attempts)
     label_prefix = f"{chunk_label}: " if chunk_label else ""
 
+    def _check_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise StageError(
+                stage="transcription",
+                message="Transcription cancelled by user.",
+                hint="Retry the lecture if you still want Markdown notes.",
+            )
+
+    def _effective_sleep(seconds: float) -> None:
+        _check_cancelled()
+        if seconds <= 0:
+            return
+        if cancel_event is not None and sleep_fn is time.sleep:
+            cancel_event.wait(timeout=seconds)
+        else:
+            sleep_fn(seconds)
+        _check_cancelled()
+
     for attempt in range(1, attempts + 1):
+        _check_cancelled()
         try:
             segments = _transcribe_single_file_once(
                 client,
@@ -324,7 +344,7 @@ def _transcribe_single_file_with_retries(
                 rate_limiter=rate_limiter,
                 chunk_label=chunk_label,
                 progress_callback=progress_callback,
-                sleep_fn=sleep_fn,
+                sleep_fn=_effective_sleep,
                 fallback_duration=fallback_duration,
             )
             if attempt > 1 and warnings is not None:
@@ -351,6 +371,7 @@ def _transcribe_single_file_with_retries(
                     stage="transcription",
                     message="Groq API authentication failed while transcribing audio.",
                     hint="Verify that GROQ_API_KEY in .env is valid and active, restart the backend, and retry.",
+                    fatal_for_queue=True,
                 ) from exc
             if not is_transient_transcription_error(exc):
                 raise StageError(
@@ -383,7 +404,7 @@ def _transcribe_single_file_with_retries(
             if progress_callback is not None:
                 progress_callback(retry_msg)
             if delay > 0:
-                sleep_fn(delay)
+                _effective_sleep(delay)
 
     raise AssertionError("Unreachable retry loop exit.")  # pragma: no cover
 
@@ -416,6 +437,7 @@ def _transcribe_in_chunks(
     progress_callback: ProgressCallback | None = None,
     warnings: list[str],
     sleep_fn: SleepFn = time.sleep,
+    cancel_event: threading.Event | None = None,
 ) -> list[TranscriptSegment]:
     total_chunks = len(chunk_specs)
     warnings_lock = threading.Lock()
@@ -431,6 +453,12 @@ def _transcribe_in_chunks(
         tmp_root = Path(tmp_dir)
 
         def _process_chunk(spec: AudioChunkSpec) -> tuple[AudioChunkSpec, list[dict[str, Any]]]:
+            if cancel_event is not None and cancel_event.is_set():
+                raise StageError(
+                    stage="transcription",
+                    message="Transcription cancelled by user.",
+                    hint="Retry the lecture if you still want Markdown notes.",
+                )
             chunk_path = tmp_root / f"chunk-{spec.index:04d}.mp3"
             label = f"Chunk {spec.index + 1}/{total_chunks}"
             try:
@@ -454,6 +482,7 @@ def _transcribe_in_chunks(
                     warnings=warnings,
                     warnings_lock=warnings_lock,
                     sleep_fn=sleep_fn,
+                    cancel_event=cancel_event,
                 )
             except StageError:
                 raise
@@ -514,6 +543,7 @@ def transcribe_audio_file(
     rate_limiter: OutboundRateLimiter | None = None,
     sleep_fn: SleepFn = time.sleep,
     duration_seconds: float | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[TranscriptArtifact, list[str], int]:
     """Transcribe a normalized MP3 file via Groq Whisper with auto-chunking and retries."""
     if not settings.groq_api_key.strip():
@@ -521,6 +551,7 @@ def transcribe_audio_file(
             stage="transcription",
             message="GROQ_API_KEY is not configured.",
             hint="Add your Groq API key to GROQ_API_KEY in .env, restart the backend, and retry.",
+            fatal_for_queue=True,
         )
 
     audio_path = Path(mp3_path)
@@ -573,6 +604,7 @@ def transcribe_audio_file(
                 progress_callback=progress_callback,
                 warnings=warnings,
                 sleep_fn=sleep_fn,
+                cancel_event=cancel_event,
             )
             segments = merge_chunk_segments(
                 [
@@ -636,6 +668,7 @@ def transcribe_audio_file(
         progress_callback=progress_callback,
         warnings=warnings,
         sleep_fn=sleep_fn,
+        cancel_event=cancel_event,
     )
 
     artifact = TranscriptArtifact(
@@ -653,6 +686,7 @@ def run_transcription_stage(context: JobContext, settings: Settings) -> StageRes
         settings,
         source_recording=context.recording_filename,
         progress_callback=context.report_progress,
+        cancel_event=context.cancel_event,
     )
 
     context.transcript_path.parent.mkdir(parents=True, exist_ok=True)

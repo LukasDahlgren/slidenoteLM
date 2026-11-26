@@ -276,11 +276,20 @@ def resolve_api_rate_limit_rule(
         )
 
     if (
-        normalized_path == "/api/jobs" or normalized_path.startswith("/api/jobs/")
-    ) and normalized_method in {"GET", "HEAD"}:
+        normalized_path == "/api/jobs"
+        or normalized_path.startswith("/api/jobs/")
+        or normalized_path == "/api/queue"
+        or normalized_path.startswith("/api/queue/")
+    ):
+        if normalized_method in {"GET", "HEAD"}:
+            return RateLimitRule(
+                name="jobs_read",
+                limit=settings.rate_limit_jobs_read_per_window,
+                window_seconds=window,
+            )
         return RateLimitRule(
-            name="jobs_read",
-            limit=settings.rate_limit_jobs_read_per_window,
+            name="queue_control",
+            limit=settings.rate_limit_queue_control_per_window,
             window_seconds=window,
         )
 

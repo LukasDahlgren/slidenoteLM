@@ -1607,6 +1607,37 @@ def _build_parallel_prompt_inputs(
     return prompts
 
 
+class _CombinedCancelEvent:
+    """Views a local section-failure event and an optional job-level cancel event together."""
+
+    def __init__(self, local: Event, external: Event | None) -> None:
+        self._local = local
+        self._external = external
+
+    def is_set(self) -> bool:
+        return self._local.is_set() or (self._external is not None and self._external.is_set())
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self._external is None:
+            return self._local.wait(timeout=timeout)
+        if self.is_set():
+            return True
+        if timeout is None:
+            while not self.is_set():
+                if self._local.wait(timeout=0.1) or self._external.is_set():
+                    return True
+            return True
+        import time as _time
+        deadline = _time.monotonic() + max(0.0, timeout)
+        while not self.is_set():
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                return self.is_set()
+            if self._local.wait(timeout=min(0.1, remaining)) or self._external.is_set():
+                return True
+        return True
+
+
 def generate_notes(
     slides_ocr: SlidesOCRArtifact,
     transcript: TranscriptArtifact,
@@ -1619,6 +1650,7 @@ def generate_notes(
     coverage_llm_callable: CoverageCheckLLMCallable | None = None,
     client_factory: GenAIClientFactory | None = None,
     progress_callback: ProgressCallback | None = None,
+    cancel_event: Event | None = None,
 ) -> NotesGenerationResult:
     """Orchestrate section chunking, rolling context carry-over, LLM/stub generation, and coverage check."""
     mode = (settings.pipeline_llm_mode or "gemini").strip().lower()
@@ -1705,12 +1737,15 @@ def generate_notes(
             and notes_workers > 1
             and total_sections > 1
         )
-        cancel_event = Event()
+        local_cancel = Event()
+        effective_cancel: Any = (
+            _CombinedCancelEvent(local_cancel, cancel_event) if cancel_event is not None else local_cancel
+        )
 
         def generate(prompt: SectionPromptInput):
             return _generate_section_notes_with_usage(
                 prompt, settings, llm_callable=section_llm_callable, client=shared_client,
-                client_factory=client_factory, progress_callback=report, cancel_event=cancel_event,
+                client_factory=client_factory, progress_callback=report, cancel_event=effective_cancel,
             )
 
         callback_lock = Lock()
@@ -1740,7 +1775,7 @@ def generate_notes(
             try:
                 result, usage = _check_coverage_with_usage(
                     coverage_input, settings, llm_callable=coverage_llm_callable, client=shared_client,
-                    client_factory=client_factory, progress_callback=report, cancel_event=cancel_event,
+                    client_factory=client_factory, progress_callback=report, cancel_event=effective_cancel,
                 )
                 return result, usage, ""
             except StageError as exc:
@@ -1785,12 +1820,18 @@ def generate_notes(
                         audits[reviews[future]] = future.result()
                         report(f"Audited transcript coverage for {len(audits)}/{audit_count} sections...")
                 except BaseException:
-                    cancel_event.set()
+                    local_cancel.set()
                     for future in (*drafts, *reviews):
                         future.cancel()
                     raise
         else:
             for section in sections:
+                if effective_cancel.is_set():
+                    raise StageError(
+                        stage="notes",
+                        message="Note generation cancelled by user.",
+                        hint="Retry the lecture if you still want Markdown notes.",
+                    )
                 idx = section.section_index
                 report(f"Generating notes for section {idx} of {total_sections}...")
                 prompt = _make_section_prompt(section, resolved_title, rolling_context)
@@ -1914,6 +1955,7 @@ def run_notes_stage(
         ),
         client_factory=client_factory,
         progress_callback=context.report_progress,
+        cancel_event=context.cancel_event,
     )
 
     context.notes_path.parent.mkdir(parents=True, exist_ok=True)

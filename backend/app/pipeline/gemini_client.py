@@ -13,6 +13,7 @@ from google import genai
 from google.genai import types
 
 from ..config import (
+    DEFAULT_GEMINI_COMBINED_RATE_LIMIT_RPM,
     DEFAULT_GEMINI_MODEL,
     DEFAULT_LLM_GLOBAL_MAX_CONCURRENT,
     DEFAULT_LLM_RATE_LIMIT_RPM,
@@ -66,6 +67,8 @@ _semaphore_lock = threading.Lock()
 _global_llm_semaphores: dict[int, threading.BoundedSemaphore] = {}
 _rate_limiter_lock = threading.Lock()
 _global_llm_rate_limiters: dict[int, OutboundRateLimiter] = {}
+_combined_rate_limiter_lock = threading.Lock()
+_global_gemini_combined_rate_limiters: dict[int, OutboundRateLimiter] = {}
 
 
 class _RetryableOutputError(Exception):
@@ -147,6 +150,7 @@ def validate_gemini_credentials(settings: Settings, *, stage: PipelineStage) -> 
                     "with valid Google Cloud Application Default Credentials, or set "
                     "GOOGLE_GENAI_USE_VERTEXAI=false and provide GEMINI_API_KEY."
                 ),
+                fatal_for_queue=True,
             )
         return
 
@@ -165,6 +169,7 @@ def validate_gemini_credentials(settings: Settings, *, stage: PipelineStage) -> 
                 "(or set GOOGLE_GENAI_USE_VERTEXAI=true and GOOGLE_CLOUD_PROJECT for Vertex AI), "
                 f"restart the backend, and retry.{extra}"
             ),
+            fatal_for_queue=True,
         )
 
 
@@ -230,6 +235,19 @@ def _get_global_llm_rate_limiter(max_rpm: int) -> OutboundRateLimiter | None:
         if limiter is None:
             limiter = OutboundRateLimiter(max_requests=limit, window_seconds=60.0)
             _global_llm_rate_limiters[limit] = limiter
+        return limiter
+
+
+def get_global_gemini_combined_rate_limiter(max_rpm: int) -> OutboundRateLimiter | None:
+    """Shared process-wide Gemini RPM ceiling spanning OCR and LLM stages."""
+    limit = max(0, int(max_rpm))
+    if limit <= 0:
+        return None
+    with _combined_rate_limiter_lock:
+        limiter = _global_gemini_combined_rate_limiters.get(limit)
+        if limiter is None:
+            limiter = OutboundRateLimiter(max_requests=limit, window_seconds=60.0)
+            _global_gemini_combined_rate_limiters[limit] = limiter
         return limiter
 
 
@@ -570,16 +588,23 @@ def call_gemini_text(
     )
 
     semaphore = _get_global_llm_semaphore(max_concurrent)
+    combined_rpm = max(
+        0,
+        int(getattr(settings, "gemini_combined_rate_limit_rpm", DEFAULT_GEMINI_COMBINED_RATE_LIMIT_RPM)),
+    )
     if rate_limiter is not None:
         resolved_limiter: OutboundRateLimiter | None = rate_limiter
+        combined_limiter: OutboundRateLimiter | None = None
     elif client_factory is not None:
         resolved_limiter = (
             OutboundRateLimiter(max_requests=rate_limit_rpm, window_seconds=60.0)
             if rate_limit_rpm > 0
             else None
         )
+        combined_limiter = None
     else:
         resolved_limiter = _get_global_llm_rate_limiter(rate_limit_rpm)
+        combined_limiter = get_global_gemini_combined_rate_limiter(combined_rpm)
 
     def _raise_if_cancelled() -> None:
         if cancel_event is not None and cancel_event.is_set():
@@ -613,6 +638,16 @@ def call_gemini_text(
                             progress_callback(wait_msg)
 
                     resolved_limiter.acquire(sleep_fn=_effective_sleep, on_wait=_notify_wait)
+                if combined_limiter is not None:
+                    def _notify_combined_wait(wait_seconds: float) -> None:
+                        wait_msg = (
+                            f"Shared Gemini quota pacing ({task_label}); waiting {wait_seconds:.1f}s..."
+                        )
+                        logger.info("%s", wait_msg)
+                        if progress_callback is not None:
+                            progress_callback(wait_msg)
+
+                    combined_limiter.acquire(sleep_fn=_effective_sleep, on_wait=_notify_combined_wait)
 
                 _raise_if_cancelled()
                 with semaphore:
@@ -662,6 +697,7 @@ def call_gemini_text(
                         stage=stage,
                         message=f"Google Gemini authentication failed ({task_label}): {exc}",
                         hint=_auth_error_hint(settings, model=resolved_model),
+                        fatal_for_queue=True,
                     ) from exc
 
                 if not is_transient_gemini_error(exc):
@@ -721,6 +757,7 @@ __all__ = [
     "extract_response_text",
     "extract_retry_after_seconds",
     "extract_usage_tokens",
+    "get_global_gemini_combined_rate_limiter",
     "is_gemini_auth_error",
     "is_gemini_live_mode",
     "is_transient_gemini_error",

@@ -22,6 +22,10 @@ export const RECORDING_ACCEPT = RECORDING_EXTENSIONS.join(',')
 export const SLIDES_ACCEPT = SLIDES_EXTENSIONS.join(',')
 
 export const POLL_INTERVAL_MS = 1500
+export const QUEUE_POLL_INTERVAL_MS = 2000
+export const QUEUE_POLL_HIDDEN_INTERVAL_MS = 8000
+export const MAX_LOGS_PER_JOB = 200
+export const MAX_LOG_TOKENS = 10
 
 export const DEFAULT_STAGES: ReadonlyArray<{ stage: PipelineStage; label: string }> = [
   { stage: 'upload', label: 'Upload' },
