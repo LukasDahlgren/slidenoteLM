@@ -3,7 +3,8 @@ import { DEFAULT_STAGES } from '../constants'
 import type { ConsoleLogEntry, JobStatusResponse, StageStateResponse } from '../types'
 
 interface LiveConsoleProps {
-  token: string
+  token: string | null
+  isUploading?: boolean
   job: JobStatusResponse | null
   logs: ConsoleLogEntry[]
   isLoading: boolean
@@ -27,6 +28,7 @@ const STAGE_SYMBOL: Record<StageStateResponse['status'], string> = {
 
 export function LiveConsole({
   token,
+  isUploading = false,
   job,
   logs,
   isLoading,
@@ -41,10 +43,12 @@ export function LiveConsole({
       : DEFAULT_STAGES.map(({ stage, label }) => ({
           stage,
           label,
-          status: 'pending',
+          status: isUploading && stage === 'upload' ? 'running' : 'pending',
           started_at: null,
           completed_at: null,
-          message: null,
+          message: isUploading && stage === 'upload'
+            ? 'Uploading recording and slides. Large recordings may take a while; keep this tab open.'
+            : null,
         }))
 
   const sharePath = job?.result_url ?? `/jobs/${token}`
@@ -72,7 +76,7 @@ export function LiveConsole({
               </span>
             ) : (
               <span className="status-badge status-badge--queued">
-                {isLoading ? 'Loading' : 'Pending'}
+                {isUploading ? 'Uploading' : isLoading ? 'Loading' : 'Pending'}
               </span>
             )}
             {job ? <span className="console-panel__pct">{job.progress_pct}%</span> : null}
@@ -86,11 +90,13 @@ export function LiveConsole({
               <span>{job.slides_filename}</span>
             </p>
           ) : (
-            <p className="console-panel__files">Job {token.slice(0, 12)}</p>
+            <p className="console-panel__files">
+              {isUploading ? 'Sending your recording and slides...' : `Job ${token?.slice(0, 12) ?? ''}`}
+            </p>
           )}
         </div>
 
-        <div className="console-panel__actions">
+        {token && !isUploading ? <div className="console-panel__actions">
           <button
             type="button"
             className="btn btn--ghost btn--sm"
@@ -102,7 +108,7 @@ export function LiveConsole({
           <button type="button" className="btn btn--ghost btn--sm" onClick={onNewUpload}>
             New upload
           </button>
-        </div>
+        </div> : null}
       </div>
 
       {pollError ? (

@@ -73,6 +73,7 @@ export function App() {
   const [recordingFile, setRecordingFile] = useState<File | null>(null)
   const [slidesFile, setSlidesFile] = useState<File | null>(null)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [uploadLogs, setUploadLogs] = useState<ConsoleLogEntry[]>([])
   const [uploadError, setUploadError] = useState<string | null>(null)
 
   const [activeToken, setActiveToken] = useState<string | null>(() =>
@@ -257,9 +258,28 @@ export function App() {
 
     setIsSubmitting(true)
     setUploadError(null)
+    const uploadLog: ConsoleLogEntry = {
+      key: `upload-start:${Date.now()}`,
+      timestamp: formatLogTime(new Date().toISOString()),
+      stage: 'upload',
+      label: 'Upload',
+      status: 'running',
+      message: `Uploading ${recordingFile.name} and ${slidesFile.name}. Keep this tab open until the upload finishes.`,
+    }
+    setUploadLogs([uploadLog])
 
     try {
       const created = await createJob(slidesFile, recordingFile)
+      setLogsByToken((prev) => ({
+        ...prev,
+        [created.token]: [uploadLog, {
+          ...uploadLog,
+          key: `upload-complete:${created.token}`,
+          timestamp: formatLogTime(new Date().toISOString()),
+          status: 'completed',
+          message: 'Upload complete. Waiting for processing updates...',
+        }],
+      }))
       const nextUrl = created.result_url || `/jobs/${created.token}`
 
       window.history.pushState({ token: created.token }, '', nextUrl)
@@ -455,13 +475,14 @@ export function App() {
               </div>
             </section>
 
-            {activeToken ? (
+            {isSubmitting || activeToken ? (
               <LiveConsole
-                token={activeToken}
-                job={job}
-                logs={activeLogs}
+                token={isSubmitting ? null : activeToken}
+                isUploading={isSubmitting}
+                job={isSubmitting ? null : job}
+                logs={isSubmitting ? uploadLogs : activeLogs}
                 isLoading={isLoadingJob}
-                pollError={pollError}
+                pollError={isSubmitting ? null : pollError}
                 onNewUpload={handleNewUpload}
               />
             ) : null}
