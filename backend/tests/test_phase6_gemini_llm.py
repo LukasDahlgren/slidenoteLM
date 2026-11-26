@@ -201,9 +201,9 @@ class TestPhase6GeminiConfigAndThinking(unittest.TestCase):
         self.assertEqual(cfg.ocr_model_google, "gemini-4-neon")
         self.assertEqual(cfg.ocr_thinking_level, "MEDIUM")
         self.assertEqual(cfg.llm_align_model, "gemini-4-neon")
-        self.assertEqual(cfg.llm_align_thinking_level, "HIGH")
+        self.assertEqual(cfg.llm_align_thinking_level, "MEDIUM")
         self.assertEqual(cfg.llm_notes_model, "gemini-4-neon")
-        self.assertEqual(cfg.llm_notes_thinking_level, "HIGH")
+        self.assertEqual(cfg.llm_notes_thinking_level, "MEDIUM")
         self.assertEqual(cfg.llm_retry_attempts, 4)
 
     def test_load_settings_parses_custom_thinking_levels_off_and_default(self) -> None:
@@ -607,7 +607,7 @@ class TestPhase6GeminiAlignment(unittest.TestCase):
         cfg = fake_client.calls[0]["config"]
         self.assertEqual(cfg.response_mime_type, "application/json")
         self.assertEqual(cfg.response_json_schema, ALIGNMENT_RESPONSE_JSON_SCHEMA)
-        self.assertEqual(cfg.thinking_config.thinking_level, types.ThinkingLevel.HIGH)
+        self.assertEqual(cfg.thinking_config.thinking_level, types.ThinkingLevel.MEDIUM)
         self.assertIsNone(cfg.temperature)
         self.assertEqual(usage["align_input_tokens"], 1200)
         self.assertEqual(usage["align_output_tokens"], 400)
@@ -784,7 +784,7 @@ class TestPhase6GeminiNotes(unittest.TestCase):
 
         notes_call_1 = fake_client.calls[0]
         self.assertEqual(notes_call_1["model"], "gemini-4-neon")
-        self.assertEqual(notes_call_1["config"].thinking_config.thinking_level, types.ThinkingLevel.HIGH)
+        self.assertEqual(notes_call_1["config"].thinking_config.thinking_level, types.ThinkingLevel.MEDIUM)
         self.assertIsNone(notes_call_1["config"].response_mime_type)
 
         self.assertIn("- **Notes Mode:** `gemini`", result.markdown)

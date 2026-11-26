@@ -263,17 +263,6 @@ export function LiveConsole({
         ) : null}
       </div>
 
-      {job && job.warnings.length > 0 ? (
-        <div className="alert alert--warning" role="status">
-          <strong>Warnings</strong>
-          <ul className="alert__list">
-            {job.warnings.map((warning, index) => (
-              <li key={`${index}-${warning}`}>{warning}</li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
-
       {job?.status === 'cancelled' ? (
         <div className="alert alert--muted" role="status">
           This lecture job was cancelled.
